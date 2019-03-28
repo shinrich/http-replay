@@ -6,8 +6,10 @@ if(NOT DEFINED CMAKE_PREFIX_PATH)
     set(CMAKE_PREFIX_PATH ${INSTALL_DIR})
 endif()
 
-add_subdirectory(src/tscore)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_subdirectory(src/core)
 add_subdirectory(src/client)
 add_subdirectory(src/server)
 
-add_custom_target(clang-format COMMAND ${CMAKE_HOME_DIRECTORY}/tools/clang-format.sh src/tscore src/client src/server)
+add_custom_target(clang-format COMMAND ${CMAKE_HOME_DIRECTORY}/tools/clang-format.sh ${CMAKE_CURRENT_SOURCE_DIR})

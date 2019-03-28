@@ -23,12 +23,12 @@
 
 #pragma once
 
-#include <iostream>
-#include <string>
-#include <map>
-#include <vector>
 #include <functional>
+#include <iostream>
+#include <map>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // more than zero arguments
 constexpr unsigned MORE_THAN_ZERO_ARG_N = ~0;
@@ -38,12 +38,10 @@ constexpr unsigned MORE_THAN_ONE_ARG_N = ~0 - 1;
 constexpr int INDENT_ONE = 32;
 constexpr int INDENT_TWO = 46;
 
-namespace ts
-{
+namespace ts {
 using AP_StrVec = std::vector<std::string>;
 // The class holding both the ENV and String arguments
-class ArgumentData
-{
+class ArgumentData {
 public:
   // bool to check if certain command/option is called
   operator bool() const noexcept { return _is_called; }
@@ -74,8 +72,7 @@ private:
 };
 
 // The class holding all the parsed data after ArgParser::parse()
-class Arguments
-{
+class Arguments {
 public:
   Arguments();
   ~Arguments();
@@ -108,8 +105,7 @@ private:
 };
 
 // Class of the ArgParser
-class ArgParser
-{
+class ArgParser {
   using Function = std::function<void()>;
 
 public:
@@ -126,8 +122,7 @@ public:
   };
 
   // Class for commands in a nested way
-  class Command
-  {
+  class Command {
   public:
     // Constructor and destructor
     Command();
@@ -135,17 +130,25 @@ public:
     /** Add an option to current command
         @return The Option object.
     */
-    Command &add_option(std::string const &long_option, std::string const &short_option, std::string const &description,
-                        std::string const &envvar = "", unsigned arg_num = 0, std::string const &default_value = "",
+    Command &add_option(std::string const &long_option,
+                        std::string const &short_option,
+                        std::string const &description,
+                        std::string const &envvar = "", unsigned arg_num = 0,
+                        std::string const &default_value = "",
                         std::string const &key = "");
 
     /** Two ways of adding a sub-command to current command:
         @return The new sub-command instance.
     */
-    Command &add_command(std::string const &cmd_name, std::string const &cmd_description, Function const &f = nullptr,
+    Command &add_command(std::string const &cmd_name,
+                         std::string const &cmd_description,
+                         Function const &f = nullptr,
                          std::string const &key = "");
-    Command &add_command(std::string const &cmd_name, std::string const &cmd_description, std::string const &cmd_envvar,
-                         unsigned cmd_arg_num, Function const &f = nullptr, std::string const &key = "");
+    Command &add_command(std::string const &cmd_name,
+                         std::string const &cmd_description,
+                         std::string const &cmd_envvar, unsigned cmd_arg_num,
+                         Function const &f = nullptr,
+                         std::string const &key = "");
     /** Add an example usage of current command for the help message
         @return The Command instance for chained calls.
     */
@@ -161,10 +164,13 @@ public:
 
   protected:
     // Main constructor called by add_command()
-    Command(std::string const &name, std::string const &description, std::string const &envvar, unsigned arg_num, Function const &f,
+    Command(std::string const &name, std::string const &description,
+            std::string const &envvar, unsigned arg_num, Function const &f,
             std::string const &key = "");
     // Helper method for add_option to check the validity of option
-    void check_option(std::string const &long_option, std::string const &short_option, std::string const &key) const;
+    void check_option(std::string const &long_option,
+                      std::string const &short_option,
+                      std::string const &key) const;
     // Helper method for add_command to check the validity of command
     void check_command(std::string const &name, std::string const &key) const;
     // Helper method for ArgParser::help_message
@@ -209,31 +215,40 @@ public:
   };
   // Base class constructors and destructor
   ArgParser();
-  ArgParser(std::string const &name, std::string const &description, std::string const &envvar, unsigned arg_num,
-            Function const &f);
+  ArgParser(std::string const &name, std::string const &description,
+            std::string const &envvar, unsigned arg_num, Function const &f);
   ~ArgParser();
 
   /** Add an option to current command with arguments
       @return The Option object.
   */
-  Command &add_option(std::string const &long_option, std::string const &short_option, std::string const &description,
-                      std::string const &envvar = "", unsigned arg_num = 0, std::string const &default_value = "",
+  Command &add_option(std::string const &long_option,
+                      std::string const &short_option,
+                      std::string const &description,
+                      std::string const &envvar = "", unsigned arg_num = 0,
+                      std::string const &default_value = "",
                       std::string const &key = "");
 
   /** Two ways of adding command to the parser:
       @return The new command instance.
   */
-  Command &add_command(std::string const &cmd_name, std::string const &cmd_description, Function const &f = nullptr,
+  Command &add_command(std::string const &cmd_name,
+                       std::string const &cmd_description,
+                       Function const &f = nullptr,
                        std::string const &key = "");
-  Command &add_command(std::string const &cmd_name, std::string const &cmd_description, std::string const &cmd_envvar,
-                       unsigned cmd_arg_num, Function const &f = nullptr, std::string const &key = "");
+  Command &add_command(std::string const &cmd_name,
+                       std::string const &cmd_description,
+                       std::string const &cmd_envvar, unsigned cmd_arg_num,
+                       Function const &f = nullptr,
+                       std::string const &key = "");
   // give a defaut command to this parser
   void set_default_command(std::string const &cmd);
   /** Main parsing function
       @return The Arguments object available for program using
   */
   Arguments parse(const char **argv);
-  // Add the usage to global_usage for help_message(). Something like: traffic_blabla [--SWITCH [ARG]]
+  // Add the usage to global_usage for help_message(). Something like:
+  // traffic_blabla [--SWITCH [ARG]]
   void add_global_usage(std::string const &usage);
   // help message that can be called
   void help_message(std::string_view err = "") const;
