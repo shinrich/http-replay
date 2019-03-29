@@ -40,7 +40,7 @@ struct Engine {
   /// Status code to return to the operating system.
   int status_code = 0;
   /// Error reporting.
-  swoc::Errata erratum;
+  swoc::Errata errata;
 };
 
 bool Shutdown_Flag = false;
@@ -50,101 +50,52 @@ std::mutex LoadMutex;
 std::unordered_map<std::string, HttpHeader, std::hash<std::string_view>>
     Transactions;
 
-void TF_Load_Session(std::atomic<int> *global_idx, int n, dirent **elements) {
-  int idx;
-  while ((idx = (*global_idx)++) < n) {
-    swoc::file::path path{elements[idx]->d_name};
-    swoc::Errata erratum;
-    std::error_code ec;
-    std::cout << "Loading [" << idx << "] " << path.c_str() << std::endl;
-    std::string content{swoc::file::load(path, ec)};
-    if (ec.value()) {
-      std::cerr << "Error: " << ec.message() << std::endl;
-    } else {
-      try {
-        auto root{YAML::Load(content)};
-        std::lock_guard<std::mutex> lock(LoadMutex);
+class ServerReplayFileHandler : public ReplayFileHandler {
+  swoc::Errata txn_open(YAML::Node const &node) override;
+  swoc::Errata proxy_request(YAML::Node const &node) override;
+  swoc::Errata server_response(YAML::Node const &node) override;
+  swoc::Errata txn_close() override;
 
-        if (root[YAML_SSN_KEY]) {
-          auto ssn_list_node{root[YAML_SSN_KEY]};
-          if (ssn_list_node.IsSequence()) {
-            for (auto const &ssn_node : ssn_list_node) {
-              if (ssn_node[YAML_TXN_KEY]) {
-                auto txn_list_node{ssn_node[YAML_TXN_KEY]};
-                if (txn_list_node.IsSequence()) {
-                  for (auto const &txn_node : txn_list_node) {
-                    std::string key;
-                    HttpHeader server_txn;
+  void reset();
 
-                    if (txn_node[YAML_PROXY_REQ_KEY]) {
-                      auto proxy_req_node{txn_node[YAML_PROXY_REQ_KEY]};
-                      if (proxy_req_node[YAML_HDR_KEY]) {
-                        auto proxy_hdr_node{proxy_req_node[YAML_HDR_KEY]};
-                        if (proxy_hdr_node[YAML_FIELDS_KEY]) {
-                          auto proxy_field_list_node{
-                              proxy_hdr_node[YAML_FIELDS_KEY]};
-                          HttpHeader proxy_txn;
-                          auto result{
-                              proxy_txn.parse_fields(proxy_field_list_node)};
-                          if (result.is_ok()) {
-                            key = proxy_txn.make_key(_key_format);
-                          } else {
-                            erratum.error("Failed to parse proxy request at {}",
-                                          proxy_req_node.Mark());
-                            erratum.note(result);
-                          }
-                        }
-                      }
-                    }
+  std::string key;
+  HttpHeader server_hdr;
+};
 
-                    if (txn_node[YAML_SERVER_RSP_KEY]) {
-                      auto response_node{txn_node[YAML_SERVER_RSP_KEY]};
-                      if (response_node[YAML_HDR_KEY]) {
-                        auto hdr_node{response_node[YAML_HDR_KEY]};
-                        if (hdr_node[YAML_FIELDS_KEY]) {
-                          auto field_list_node{hdr_node[YAML_FIELDS_KEY]};
-                          auto result{server_txn.parse_fields(field_list_node)};
-                          if (!result.is_ok()) {
-                            erratum.error(
-                                "Failed to parse server response at {}",
-                                response_node.Mark());
-                            erratum.note(result);
-                          }
-                        }
-                      }
-                    }
+void ServerReplayFileHandler::reset() {
+  server_hdr.~HttpHeader();
+  new (&server_hdr) HttpHeader;
+}
 
-                    if (erratum.is_ok()) {
-                      Transactions[key] = std::move(server_txn);
-                    } else {
-                      std::cerr << erratum;
-                    }
-                  }
-                }
-              }
-            }
-          } else {
-            erratum.error(R"("{}" value at {} is not a sequence.)",
-                          YAML_SSN_KEY, ssn_list_node.Mark());
-          }
-        } else {
-          erratum.error(R"(Failed to parse "{}".)", path.c_str());
-        }
-      } catch (std::exception const &ex) {
-        erratum.error("Exception: {}", ex.what());
-      }
-    }
-    if (!erratum.is_ok()) {
-      std::cerr << erratum;
-    }
+swoc::Errata ServerReplayFileHandler::txn_open(YAML::Node const &) {
+  LoadMutex.lock();
+  return {};
+}
+
+swoc::Errata ServerReplayFileHandler::proxy_request(YAML::Node const &node) {
+  HttpHeader hdr;
+  swoc::Errata errata = hdr.load(node);
+  if (errata.is_ok()) {
+    key = hdr.make_key();
   }
+  return errata;
+}
+
+swoc::Errata ServerReplayFileHandler::server_response(YAML::Node const &node) {
+  return server_hdr.load(node);
+}
+
+swoc::Errata ServerReplayFileHandler::txn_close() {
+  Transactions[key] = std::move(server_hdr);
+  LoadMutex.unlock();
+  this->reset();
+  return {};
 }
 
 void TF_Server(int socket_fd) {
-  static constexpr TextView TERMINATOR{"\r\n\r\n"};
   swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
   while (!Shutdown_Flag) {
-    swoc::Errata erratum;
+    swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
     socklen_t remote_addr_size;
     int fd = accept(socket_fd, &remote_addr.sa, &remote_addr_size);
@@ -155,111 +106,102 @@ void TF_Server(int socket_fd) {
         n = read(fd, w.aux_data(), w.remaining());
         if (n >= 0) {
           w.commit(n);
-          if (swoc::TextView::npos != w.view().rfind("\r\n\r\n")) {
-            HttpHeader proxy_req;
-            if (Parse_Request(w.view(), proxy_req)) {
-              auto key{proxy_req.make_key(_key_format)};
-              auto spot{Transactions.find(key)};
-              if (spot != Transactions.end()) {
-                spot->second.transmit(fd);
-                close(fd);
-              } else {
-                erratum.error(R"(Proxy request with key "{}" not found.)", key);
-              }
+          HttpHeader proxy_hdr;
+          auto result{proxy_hdr.parse_request(w.view())};
+          if (HttpHeader::PARSE_INCOMPLETE == result.result()) {
+            continue;
+          }
+          if (result.is_ok()) {
+            auto key{proxy_hdr.make_key()};
+            auto spot{Transactions.find(key)};
+            if (spot != Transactions.end()) {
+              spot->second.transmit(fd);
+              close(fd);
             } else {
-              erratum.error(R"(Proxy request was malformed.)");
+              errata.error(R"(Proxy request with key "{}" not found.)", key);
             }
+          } else {
+            errata.error(R"(Proxy request was malformed.)");
+            errata.note(result);
           }
         } else if (n < 0) {
           break;
         }
       }
-    }
-    if (!erratum.is_ok()) {
-      std::cerr << erratum;
+      if (!errata.is_ok()) {
+        std::cerr << errata;
+      }
     }
   }
 }
 
 void Engine::command_run() {
+  auto args{arguments.get("run")};
   swoc::IPEndpoint server_addr;
   auto server_addr_arg{arguments.get("listen")};
   swoc::LocalBufferWriter<1024> w;
 
+  if (args.size() < 1) {
+    errata.error(
+        R"("run" command requires a directory path as an argument.)");
+  }
+
   if (server_addr_arg) {
     if (server_addr_arg.size() == 1) {
       if (!server_addr.parse(server_addr_arg[0])) {
-        erratum.error(R"("{}" is not a valid IP address.)", server_addr_arg);
+        errata.error(R"("{}" is not a valid IP address.)", server_addr_arg);
         return;
       }
     } else {
-      erratum.error(
+      errata.error(
           R"(--listen option must have a single value, the listen address and port.)");
     }
   }
 
-  dirent **elements = nullptr;
-  auto base_path{arguments.get("run")[0]};
+  Load_Replay_Directory(swoc::file::path{args[0]},
+                        [](swoc::file::path const &file) -> swoc::Errata {
+                          ServerReplayFileHandler handler;
+                          return Load_Replay_File(file, handler);
+                        },
+                        10);
 
-  if (0 == chdir(base_path.data())) {
-    int n_sessions =
-        scandir(".", &elements,
-                [](const dirent *entry) -> int {
-                  return 0 == strcasecmp(swoc::TextView{entry->d_name,
-                                                        strlen(entry->d_name)}
-                                             .suffix_at('.'),
-                                         "json")
-                             ? 1
-                             : 0;
-                },
-                &alphasort);
-    std::cout << "Loading " << n_sessions << " session files" << std::endl;
+  // After this, any string expected to be localized that isn't is an error,
+  // so lock down the local string storage to avoid locking and report an
+  // error instead if not found.
+  HttpHeader::_frozen = true;
+  size_t max_content_length = 0;
+  for (auto const &[key, value] : Transactions) {
+    max_content_length =
+        std::max<size_t>(max_content_length, value._content_size);
+  }
+  HttpHeader::set_max_content_length(max_content_length);
 
-    std::array<std::thread, 10> threads;
-    std::atomic_int idx{0};
-    for (int x = 0; x < std::tuple_size<decltype(threads)>::value; ++x) {
-      threads[x] = std::thread(TF_Load_Session, &idx, n_sessions, elements);
-    }
+  std::cout << "Ready" << std::endl;
 
-    for (int x = 0; x < std::tuple_size<decltype(threads)>::value; ++x) {
-      threads[x].join();
-    }
+  // Set up listen port.
+  int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
+  if (socket_fd >= 0) {
+    int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
+    if (bind_result == 0) {
+      int listen_result = listen(socket_fd, 1);
+      if (listen_result == 0) {
+        w.print(R"(Listening at {})", server_addr);
+        std::cout << w.view() << std::endl;
 
-    // After this, any string expected to be localized that isn't is an error,
-    // so lock down the local string storage to avoid locking and report an
-    // error instead if not found.
-    HttpHeader::_frozen = true;
-
-    std::cout << "Ready" << std::endl;
-
-    // Set up listen port.
-    int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
-    if (socket_fd >= 0) {
-      int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
-      if (bind_result == 0) {
-        int listen_result = listen(socket_fd, 1);
-        if (listen_result == 0) {
-          w.print(R"(Listening at {})", server_addr);
-          std::cout << w.view() << std::endl;
-
-          std::thread runner{TF_Server, socket_fd};
-          runner.join();
-        } else {
-          erratum.error(R"(Could not listen to {} - {}.)", server_addr,
-                        swoc::bwf::Errno{listen_result});
-        }
+        std::thread runner{TF_Server, socket_fd};
+        runner.join();
       } else {
-        erratum.error(R"(Could not bind to {} - {}.)", server_addr,
-                      swoc::bwf::Errno{bind_result});
+        errata.error(R"(Could not listen to {} - {}.)", server_addr,
+                     swoc::bwf::Errno{listen_result});
       }
     } else {
-      erratum.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
+      errata.error(R"(Could not bind to {} - {}.)", server_addr,
+                   swoc::bwf::Errno{bind_result});
     }
   } else {
-    erratum.error(R"(Could not access directory "{}" - {}.)", base_path,
-                  swoc::bwf::Errno{});
+    errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
   }
-};
+}
 
 int main(int argc, const char *argv[]) {
   Engine engine;
@@ -279,8 +221,8 @@ int main(int argc, const char *argv[]) {
 
   engine.arguments.invoke();
 
-  if (!engine.erratum.is_ok()) {
-    std::cerr << engine.erratum;
+  if (!engine.errata.is_ok()) {
+    std::cerr << engine.errata;
   }
   return engine.status_code;
 }

@@ -12,7 +12,7 @@ add_executable(replay-server
     replay-server.cc
 )
 
-target_link_libraries(replay-server PUBLIC swoc++::swoc++ yaml-cpp lib-replay-core Threads::Threads)
+target_link_libraries(replay-server PUBLIC lib-replay-core swoc++::swoc++ yaml-cpp Threads::Threads)
 
 install(TARGETS replay-server
     EXPORT replay-server-config

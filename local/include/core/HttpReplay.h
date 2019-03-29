@@ -33,6 +33,7 @@
 #include "swoc/TextView.h"
 #include "swoc/bwf_base.h"
 #include "swoc/swoc_file.h"
+#include "swoc/swoc_ip.h"
 
 // Definitions of keys in the CONFIG files.
 // These need to be @c std::string or the node look up will construct a @c
@@ -45,6 +46,9 @@ static const std::string YAML_SERVER_RSP_KEY{"server-response"};
 static const std::string YAML_PROXY_RSP_KEY{"proxy-response"};
 static const std::string YAML_HDR_KEY{"headers"};
 static const std::string YAML_FIELDS_KEY{"fields"};
+static const std::string YAML_HTTP_VERSION_KEY{"version"};
+static const std::string YAML_CONTENT_KEY{"content"};
+static const std::string YAML_CONTENT_LENGTH_KEY{"size"};
 
 static constexpr size_t MAX_REQ_HDR_SIZE = 65536;
 static constexpr size_t MAX_RSP_HDR_SIZE = 65536;
@@ -62,20 +66,25 @@ class HttpHeader {
 public:
   enum ParseResult { PARSE_OK, PARSE_ERROR, PARSE_INCOMPLETE };
 
-  /** Write the transaction to @a fd.
+  /** Write the header to @a fd.
    *
    * @param fd Ouput stream.
    */
-  void transmit(int fd);
+  swoc::Errata transmit(int fd) const;
 
+  swoc::Errata load(YAML::Node const &node);
   swoc::Errata parse_fields(YAML::Node const &field_list_node);
 
   swoc::Rv<ParseResult> parse_request(TextView data);
 
-  std::string make_key(TextView fmt);
+  std::string make_key();
 
   unsigned _status = 0;
+  TextView _reason;
   unsigned _content_size = 0;
+  TextView _method;
+  TextView _http_version;
+  std::string _url;
   Fields _fields;
 
   /// Format string to generate a key from a transaction.
@@ -83,6 +92,8 @@ public:
 
   /// String localization frozen?
   static bool _frozen;
+
+  static void set_max_content_length(size_t n);
 
 protected:
   class Binding : public swoc::bwf::ContextNames<const HttpHeader> {
@@ -110,26 +121,56 @@ protected:
   using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
   static NameSet _names;
   static swoc::MemArena _arena;
+  /// Precomputed content buffer.
+  static swoc::MemSpan<char> _content;
 };
 
 // YAML support utilities.
 namespace swoc {
-BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
-                       YAML::Mark const &mark) {
+inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
+                              YAML::Mark const &mark) {
   return w.print("line {}", mark.line);
 }
 } // namespace swoc
 
 class ReplayFileHandler {
 public:
-  virtual swoc::Errata ssn_open(YAML::Node const &node) {}
-  virtual swoc::Errata ssn_close() {}
-  virtual swoc::Errata txn_open(YAML::Node const &node) {}
-  virtual swoc::Errata txn_close() {}
-  virtual swoc::Errata client_request(YAML::Node const &node) {}
-  virtual swoc::Errata proxy_request(YAML::Node const &node) {}
-  virtual swoc::Errata server_response(YAML::Node const &node) {}
-  virtual swoc::Errata proxy_response(YAML::Node const &node) {}
+  virtual swoc::Errata ssn_open(YAML::Node const &node) { return {}; }
+  virtual swoc::Errata ssn_close() { return {}; }
+  virtual swoc::Errata txn_open(YAML::Node const &node) { return {}; }
+  virtual swoc::Errata txn_close() { return {}; }
+  virtual swoc::Errata client_request(YAML::Node const &node) { return {}; }
+  virtual swoc::Errata proxy_request(YAML::Node const &node) { return {}; }
+  virtual swoc::Errata server_response(YAML::Node const &node) { return {}; }
+  virtual swoc::Errata proxy_response(YAML::Node const &node) { return {}; }
 };
 
-swoc::Errata Load_Replay_File(swoc::file::path const &path, ReplayFileHandler &handler);
+swoc::Errata Load_Replay_File(swoc::file::path const &path,
+                              ReplayFileHandler &handler);
+
+swoc::Errata
+Load_Replay_Directory(swoc::file::path const &path,
+                      swoc::Errata (*loader)(swoc::file::path const &),
+                      int n_threads = 10);
+
+swoc::Rv<swoc::IPEndpoint> Resolve_FQDN(swoc::TextView host);
+
+namespace swoc {
+inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
+                              swoc::file::path const &path) {
+  return bwformat(w, spec, path.string());
+}
+} // namespace swoc
+
+namespace std {
+template <typename R>
+class tuple_size<swoc::Rv<R>> : public std::integral_constant<size_t, 2> {};
+template <typename R> class tuple_element<0, swoc::Rv<R>> {
+public:
+  using type = R;
+};
+template <typename R> class tuple_element<1, swoc::Rv<R>> {
+public:
+  using type = swoc::Errata;
+};
+} // namespace std

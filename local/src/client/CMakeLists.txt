@@ -6,13 +6,13 @@ include(GNUInstallDirs)
 
 find_package(swoc++ CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 add_executable(replay-client
     replay-client.cc
 )
 
-target_link_libraries(replay-client PUBLIC swoc++::swoc++ yaml-cpp lib-tscore)
-target_include_directories(replay-client PRIVATE ../include)
+target_link_libraries(replay-client PUBLIC lib-replay-core swoc++::swoc++ yaml-cpp Threads::Threads)
 
 install(TARGETS replay-client
     EXPORT replay-client-config
