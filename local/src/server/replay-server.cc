@@ -92,7 +92,50 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
   return {};
 }
 
-void TF_Server(int socket_fd) {
+void TF_Serve(int socket_fd) {
+  swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+  bool done_p = false;
+  while (!done_p) {
+    swoc::Errata errata;
+    ssize_t n;
+    w.clear();
+    while (w.remaining() > 0) {
+      n = read(socket_fd, w.aux_data(), w.remaining());
+      if (n >= 0) {
+        w.commit(n);
+        HttpHeader proxy_hdr;
+        auto result{proxy_hdr.parse_request(w.view())};
+        if (HttpHeader::PARSE_INCOMPLETE == result.result()) {
+          continue;
+        }
+        if (result.is_ok()) {
+          auto key{proxy_hdr.make_key()};
+          auto spot{Transactions.find(key)};
+          if (spot != Transactions.end()) {
+            spot->second.transmit(fd);
+            close(fd);
+          } else {
+            errata.error(R"(Proxy request with key "{}" not found.)", key);
+          }
+        } else {
+          errata.error(R"(Proxy request was malformed.)");
+          errata.note(result);
+        }
+      } else {
+        if (errno != EINTR) {
+          close (socket_fd);
+          done_p = true;
+          break;
+        }
+      }
+    }
+    if (!errata.is_ok()) {
+      std::cerr << errata;
+    }
+  }
+}
+
+void TF_Accept(int socket_fd) {
   swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
@@ -100,37 +143,7 @@ void TF_Server(int socket_fd) {
     socklen_t remote_addr_size;
     int fd = accept(socket_fd, &remote_addr.sa, &remote_addr_size);
     if (fd >= 0) {
-      ssize_t n;
-      w.clear();
-      while (w.remaining() > 0) {
-        n = read(fd, w.aux_data(), w.remaining());
-        if (n >= 0) {
-          w.commit(n);
-          HttpHeader proxy_hdr;
-          auto result{proxy_hdr.parse_request(w.view())};
-          if (HttpHeader::PARSE_INCOMPLETE == result.result()) {
-            continue;
-          }
-          if (result.is_ok()) {
-            auto key{proxy_hdr.make_key()};
-            auto spot{Transactions.find(key)};
-            if (spot != Transactions.end()) {
-              spot->second.transmit(fd);
-              close(fd);
-            } else {
-              errata.error(R"(Proxy request with key "{}" not found.)", key);
-            }
-          } else {
-            errata.error(R"(Proxy request was malformed.)");
-            errata.note(result);
-          }
-        } else if (n < 0) {
-          break;
-        }
-      }
-      if (!errata.is_ok()) {
-        std::cerr << errata;
-      }
+      TF_Serve(fd);
     }
   }
 }
