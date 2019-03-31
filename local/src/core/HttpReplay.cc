@@ -79,15 +79,9 @@ swoc::Errata HttpHeader::parse_fields(YAML::Node const &field_list_node) {
   for (auto const &field_node : field_list_node) {
     if (field_node.IsSequence()) {
       if (field_node.size() == 2) {
-        auto name{this->localize(field_node[0].Scalar())};
+        TextView name{this->localize(field_node[0].Scalar())};
         TextView value{field_node[1].Scalar()};
-        if (name.is_ok()) {
-          _fields[name] = value;
-        } else {
-          errata.error("Unexpected field name.");
-          errata.note(name.errata());
-          break;
-        }
+        _fields[name] = value;
       } else {
         errata.error("Field at {} is not a sequence of length 2 as required.",
                      field_node.Mark());
@@ -146,21 +140,18 @@ std::string HttpHeader::make_key() {
   return std::move(key);
 };
 
-auto HttpHeader::localize(TextView name) -> swoc::Rv<TextView> {
-  auto spot = _names.find(name);
+swoc::TextView HttpHeader::localize(TextView text) {
+  auto spot = _names.find(text);
   if (spot != _names.end()) {
     return *spot;
   } else if (!_frozen) {
-    auto span{_arena.alloc(name.size()).rebind<char>()};
-    memcpy(span.data(), name.data(), name.size());
-    TextView local{span.data(), name.size()};
+    auto span{_arena.alloc(text.size()).rebind<char>()};
+    memcpy(span.data(), text.data(), text.size());
+    TextView local{span.data(), text.size()};
     _names.insert(local);
     return local;
-  } else {
-    swoc::Errata errata;
-    errata.error(R"(Non-localized string "{}")", name);
-    return {{}, std::move(errata)};
   }
+  return text;
 }
 
 swoc::Rv<HttpHeader::ParseResult>
@@ -183,13 +174,14 @@ HttpHeader::parse_request(swoc::TextView data) {
         if (field.empty()) {
           continue;
         }
-        auto name_result{this->localize(field.take_prefix_at(':'))};
-        if (name_result.is_ok()) {
-          _fields[name_result] = field.ltrim_if(&isspace);
+        auto value { field };
+        auto name{this->localize(value.take_prefix_at(':'))};
+        value.trim_if(&isspace);
+        if (name && value) {
+          _fields[name] = value;
         } else {
-          zret.errata().error(R"(Unexpected field name "{}" in request.)",
-                              name_result.result());
-          break;
+          zret = PARSE_ERROR;
+          zret.errata().error(R"(Malformed field "{}".)", field);
         }
       }
     } else {

@@ -96,34 +96,36 @@ void TF_Serve(int socket_fd) {
   swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
   bool done_p = false;
   while (!done_p) {
+    HttpHeader req_hdr;
     swoc::Errata errata;
     ssize_t n;
     w.clear();
     while (w.remaining() > 0) {
       n = read(socket_fd, w.aux_data(), w.remaining());
       if (n >= 0) {
+        size_t offset =
+            std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
         w.commit(n);
-        HttpHeader proxy_hdr;
-        auto result{proxy_hdr.parse_request(w.view())};
-        if (HttpHeader::PARSE_INCOMPLETE == result.result()) {
+        if (TextView::npos == w.view().substr(offset).find(HTTP_EOH)) {
           continue;
         }
+        auto result{req_hdr.parse_request(w.view())};
         if (result.is_ok()) {
-          auto key{proxy_hdr.make_key()};
+          auto key{req_hdr.make_key()};
           auto spot{Transactions.find(key)};
           if (spot != Transactions.end()) {
-            spot->second.transmit(fd);
-            close(fd);
+            spot->second.transmit(socket_fd);
           } else {
             errata.error(R"(Proxy request with key "{}" not found.)", key);
           }
         } else {
           errata.error(R"(Proxy request was malformed.)");
           errata.note(result);
+          done_p = true;
+          break;
         }
       } else {
         if (errno != EINTR) {
-          close (socket_fd);
           done_p = true;
           break;
         }
@@ -133,6 +135,7 @@ void TF_Serve(int socket_fd) {
       std::cerr << errata;
     }
   }
+  close(socket_fd);
 }
 
 void TF_Accept(int socket_fd) {
@@ -201,7 +204,7 @@ void Engine::command_run() {
         w.print(R"(Listening at {})", server_addr);
         std::cout << w.view() << std::endl;
 
-        std::thread runner{TF_Server, socket_fd};
+        std::thread runner{TF_Accept, socket_fd};
         runner.join();
       } else {
         errata.error(R"(Could not listen to {} - {}.)", server_addr,

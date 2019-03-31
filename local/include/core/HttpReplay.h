@@ -115,7 +115,14 @@ protected:
                              const swoc::bwf::Spec &spec) const override;
   };
 
-  swoc::Rv<TextView> localize(TextView name);
+  /** Convert @a name to a localized view.
+   *
+   * @param name Text to localize.
+   * @return The localized view, or @a name if localization is frozen and @a name is not found.
+   *
+   * @a name will be localized if string localization is not frozen, or @a name is already localized.
+   */
+  TextView localize(TextView text);
 
   static Binding _binding;
   using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
