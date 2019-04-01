@@ -102,7 +102,7 @@ void TF_Serve(int socket_fd) {
     w.clear();
     while (w.remaining() > 0) {
       n = read(socket_fd, w.aux_data(), w.remaining());
-      if (n >= 0) {
+      if (n > 0) {
         size_t offset =
             std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
         w.commit(n);
@@ -117,6 +117,8 @@ void TF_Serve(int socket_fd) {
             spot->second.transmit(socket_fd);
           } else {
             errata.error(R"(Proxy request with key "{}" not found.)", key);
+            done_p = true;
+            break;
           }
         } else {
           errata.error(R"(Proxy request was malformed.)");
@@ -174,12 +176,25 @@ void Engine::command_run() {
     }
   }
 
-  Load_Replay_Directory(swoc::file::path{args[0]},
-                        [](swoc::file::path const &file) -> swoc::Errata {
-                          ServerReplayFileHandler handler;
-                          return Load_Replay_File(file, handler);
-                        },
-                        10);
+  if (!errata.is_ok()) {
+    return;
+  }
+
+  errata =
+      Load_Replay_Directory(swoc::file::path{args[0]},
+                            [](swoc::file::path const &file) -> swoc::Errata {
+                              ServerReplayFileHandler handler;
+                              return Load_Replay_File(file, handler);
+                            },
+                            10);
+
+  if (!errata.is_ok()) {
+    return;
+  }
+  if (errata.count()) {
+    std::cout << errata;
+    errata.clear();
+  }
 
   // After this, any string expected to be localized that isn't is an error,
   // so lock down the local string storage to avoid locking and report an
@@ -208,11 +223,11 @@ void Engine::command_run() {
         runner.join();
       } else {
         errata.error(R"(Could not listen to {} - {}.)", server_addr,
-                     swoc::bwf::Errno{listen_result});
+                     swoc::bwf::Errno{});
       }
     } else {
       errata.error(R"(Could not bind to {} - {}.)", server_addr,
-                   swoc::bwf::Errno{bind_result});
+                   swoc::bwf::Errno{});
     }
   } else {
     errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});

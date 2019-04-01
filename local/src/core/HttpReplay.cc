@@ -52,7 +52,7 @@ swoc::Errata HttpHeader::transmit(int fd) const {
 
   if (_status) {
     swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
-    w.print("{} {}{}", _status, _reason, HTTP_EOL);
+    w.print("HTTP/{} {} {}{}", _http_version, _status, _reason, HTTP_EOL);
     for (auto const &[name, value] : _fields) {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
@@ -103,6 +103,45 @@ swoc::Errata HttpHeader::load(YAML::Node const &node) {
     _http_version = "1.1";
   }
 
+  if (node[YAML_HTTP_STATUS_KEY]) {
+    auto status_node{node[YAML_HTTP_STATUS_KEY]};
+    if (status_node.IsScalar()) {
+      TextView text{status_node.Scalar()};
+      TextView parsed;
+      auto n = swoc::svtou(text, &parsed);
+      if (parsed.size() == text.size() && 0 < n && n <= 599) {
+        _status = n;
+      } else {
+        errata.error(
+            R"("{}" value "{}" at {} must an integer in the range [1..599].)",
+            YAML_HTTP_STATUS_KEY, text, status_node.Mark());
+      }
+    } else {
+      errata.error(R"("{}" value at {} must an integer in the range [1..599].)",
+                   YAML_HTTP_STATUS_KEY, status_node.Mark());
+    }
+  }
+
+  if (node[YAML_HTTP_REASON_KEY]) {
+    auto reason_node{node[YAML_HTTP_REASON_KEY]};
+    if (reason_node.IsScalar()) {
+      _reason = this->localize(reason_node.Scalar());
+    } else {
+      errata.error(R"("{}" value at {} must a string.)", YAML_HTTP_REASON_KEY,
+                   reason_node.Mark());
+    }
+  }
+
+  if (node[YAML_HTTP_METHOD_KEY]) {
+    auto method_node{node[YAML_HTTP_METHOD_KEY]};
+    if (method_node.IsScalar()) {
+      _method = this->localize(method_node.Scalar());
+    } else {
+      errata.error(R"("{}" value at {} must a string.)", YAML_HTTP_REASON_KEY,
+                   method_node.Mark());
+    }
+  }
+
   if (node[YAML_CONTENT_KEY]) {
     auto content_node{node[YAML_CONTENT_KEY]};
     if (content_node.IsMap()) {
@@ -127,6 +166,13 @@ swoc::Errata HttpHeader::load(YAML::Node const &node) {
       }
     }
   }
+
+  if (0 == _status && !_method) {
+    errata.error(
+        R"(HTTP header at {} has neither a status as a response nor a method as a request.)",
+        node.Mark());
+  }
+
   return errata;
 }
 
@@ -174,7 +220,7 @@ HttpHeader::parse_request(swoc::TextView data) {
         if (field.empty()) {
           continue;
         }
-        auto value { field };
+        auto value{field};
         auto name{this->localize(value.take_prefix_at(':'))};
         value.trim_if(&isspace);
         if (name && value) {
@@ -221,7 +267,7 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
     try {
       root = YAML::Load(content);
     } catch (std::exception const &ex) {
-      errata.error("Exception: {}", ex.what());
+      errata.error(R"(Exception: {} in "{}".)", ex.what(), path);
     }
     if (errata.is_ok()) {
       if (root[YAML_SSN_KEY]) {
@@ -254,36 +300,36 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
                           }
                           errata = std::move(result);
                         } else {
-                          errata.error("Transaction node at {} did not contain "
-                                       "all four required HTTP header keys.",
-                                       txn_node.Mark());
+                          errata.error(
+                              R"(Transaction node at {} in "{}" did not contain all four required HTTP header keys.)",
+                              txn_node.Mark(), path);
                         }
                       }
                       result.note(handler.ssn_close());
                     }
                     errata.note(result);
                   } else {
-                    errata.warn(
-                        R"(Transaction list at {} in session at {} is an empty list.)",
-                        txn_list_node.Mark(), ssn_node.Mark());
+                    errata.info(
+                        R"(Transaction list at {} in session at {} in "{}" is an empty list.)",
+                        txn_list_node.Mark(), ssn_node.Mark(), path);
                   }
                 } else {
                   errata.error(
-                      R"(Transaction list at {} in session at {} is not a list.)",
-                      txn_list_node.Mark(), ssn_node.Mark());
+                      R"(Transaction list at {} in session at {} in "{}" is not a list.)",
+                      txn_list_node.Mark(), ssn_node.Mark(), path);
                 }
               } else {
-                errata.error(R"(Session at {} has no "{}" key.)",
-                             ssn_node.Mark(), YAML_TXN_KEY);
+                errata.error(R"(Session at {} in "{}" has no "{}" key.)",
+                             ssn_node.Mark(), path, YAML_TXN_KEY);
               }
             }
           } else {
-            errata.error(R"(Session list at {} is an empty list.)",
-                         ssn_list_node.Mark());
+            errata.info(R"(Session list at {} in "{}" is an empty list.)",
+                        ssn_list_node.Mark(), path);
           }
         } else {
-          errata.error(R"("{}" value at {} is not a sequence.)", YAML_SSN_KEY,
-                       ssn_list_node.Mark());
+          errata.error(R"("{}" value at {} in "{}" is not a sequence.)",
+                       YAML_SSN_KEY, ssn_list_node.Mark(), path);
         }
       } else {
         errata.error(R"(Failed to parse "{}".)", path.c_str());

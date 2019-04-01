@@ -47,6 +47,9 @@ static const std::string YAML_PROXY_RSP_KEY{"proxy-response"};
 static const std::string YAML_HDR_KEY{"headers"};
 static const std::string YAML_FIELDS_KEY{"fields"};
 static const std::string YAML_HTTP_VERSION_KEY{"version"};
+static const std::string YAML_HTTP_STATUS_KEY{"status"};
+static const std::string YAML_HTTP_REASON_KEY{"reason"};
+static const std::string YAML_HTTP_METHOD_KEY{"method"};
 static const std::string YAML_CONTENT_KEY{"content"};
 static const std::string YAML_CONTENT_LENGTH_KEY{"size"};
 
@@ -118,9 +121,11 @@ protected:
   /** Convert @a name to a localized view.
    *
    * @param name Text to localize.
-   * @return The localized view, or @a name if localization is frozen and @a name is not found.
+   * @return The localized view, or @a name if localization is frozen and @a
+   * name is not found.
    *
-   * @a name will be localized if string localization is not frozen, or @a name is already localized.
+   * @a name will be localized if string localization is not frozen, or @a name
+   * is already localized.
    */
   TextView localize(TextView text);
 
