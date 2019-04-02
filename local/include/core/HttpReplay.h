@@ -32,6 +32,7 @@
 #include "swoc/MemArena.h"
 #include "swoc/TextView.h"
 #include "swoc/bwf_base.h"
+#include "swoc/ext/HashFNV.h"
 #include "swoc/swoc_file.h"
 #include "swoc/swoc_ip.h"
 
@@ -50,12 +51,13 @@ static const std::string YAML_HTTP_VERSION_KEY{"version"};
 static const std::string YAML_HTTP_STATUS_KEY{"status"};
 static const std::string YAML_HTTP_REASON_KEY{"reason"};
 static const std::string YAML_HTTP_METHOD_KEY{"method"};
+static const std::string YAML_HTTP_URL_KEY{"url"};
 static const std::string YAML_CONTENT_KEY{"content"};
 static const std::string YAML_CONTENT_LENGTH_KEY{"size"};
 
 static constexpr size_t MAX_REQ_HDR_SIZE = 65536;
 static constexpr size_t MAX_RSP_HDR_SIZE = 65536;
-
+static constexpr size_t MAX_DRAIN_BUFFER_SIZE = 1 << 20;
 /// HTTP end of line.
 static constexpr swoc::TextView HTTP_EOL{"\r\n"};
 /// HTTP end of header.
@@ -69,6 +71,8 @@ class HttpHeader {
 public:
   enum ParseResult { PARSE_OK, PARSE_ERROR, PARSE_INCOMPLETE };
 
+  static TextView FIELD_CONTENT_LENGTH;
+
   /** Write the header to @a fd.
    *
    * @param fd Ouput stream.
@@ -79,6 +83,7 @@ public:
   swoc::Errata parse_fields(YAML::Node const &field_list_node);
 
   swoc::Rv<ParseResult> parse_request(TextView data);
+  swoc::Rv<ParseResult> parse_response(TextView data);
 
   std::string make_key();
 
@@ -97,6 +102,8 @@ public:
   static bool _frozen;
 
   static void set_max_content_length(size_t n);
+
+  static void global_init();
 
 protected:
   class Binding : public swoc::bwf::ContextNames<const HttpHeader> {
@@ -127,10 +134,20 @@ protected:
    * @a name will be localized if string localization is not frozen, or @a name
    * is already localized.
    */
-  TextView localize(TextView text);
+  static TextView localize(TextView text);
 
   static Binding _binding;
-  using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
+  //  using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
+  struct Hash {
+    swoc::Hash64FNV1a::value_type operator()(TextView view) const {
+      return swoc::Hash64FNV1a{}.hash_immediate(
+          swoc::transform_view_of(&tolower, view));
+    }
+    bool operator()(TextView lhs, TextView rhs) const {
+      return 0 == strcasecmp(lhs, rhs);
+    }
+  };
+  using NameSet = std::unordered_set<TextView, Hash, Hash>;
   static NameSet _names;
   static swoc::MemArena _arena;
   /// Precomputed content buffer.

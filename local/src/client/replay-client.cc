@@ -9,6 +9,8 @@
 #include "core/HttpReplay.h"
 #include "swoc/bwf_ex.h"
 
+using swoc::TextView;
+
 struct Txn {
   HttpHeader _req; ///< Request to send.
   HttpHeader _rsp; ///< Response to expect.
@@ -31,8 +33,6 @@ class ClientReplayFileHandler : public ReplayFileHandler {
   swoc::Errata txn_close() override;
   swoc::Errata ssn_close() override;
 
-  swoc::Errata handle_request(YAML::Node const &node, HttpHeader &hdr);
-  swoc::Errata handle_response(YAML::Node const &node, HttpHeader &hdr);
   void txn_reset();
   void ssn_reset();
 
@@ -59,67 +59,30 @@ swoc::Errata ClientReplayFileHandler::txn_open(YAML::Node const &) {
   return {};
 }
 
-swoc::Errata ClientReplayFileHandler::handle_request(YAML::Node const &node,
-                                                     HttpHeader &hdr) {
-  swoc::Errata errata;
-
-  if (node[YAML_HDR_KEY]) {
-    auto proxy_hdr_node{node[YAML_HDR_KEY]};
-    if (proxy_hdr_node[YAML_FIELDS_KEY]) {
-      auto proxy_field_list_node{proxy_hdr_node[YAML_FIELDS_KEY]};
-      auto result{hdr.parse_fields(proxy_field_list_node)};
-      if (!result.is_ok()) {
-        errata.error("Failed to parse request at {}", node.Mark());
-        errata.note(result);
-      }
-    }
-  }
-  return errata;
-}
-
 swoc::Errata ClientReplayFileHandler::client_request(YAML::Node const &node) {
   if (!Proxy_Mode) {
-    return this->handle_request(node, _txn._req);
+    return _txn._req.load(node);
   }
   return {};
 }
 
 swoc::Errata ClientReplayFileHandler::proxy_request(YAML::Node const &node) {
   if (Proxy_Mode) {
-    return this->handle_request(node, _txn._req);
+    return _txn._req.load(node);
   }
   return {};
 }
 
-swoc::Errata ClientReplayFileHandler::handle_response(YAML::Node const &node,
-                                                      HttpHeader &hdr) {
-  swoc::Errata errata;
-
-  if (node[YAML_HDR_KEY]) {
-    auto hdr_node{node[YAML_HDR_KEY]};
-    if (hdr_node[YAML_FIELDS_KEY]) {
-      auto field_list_node{hdr_node[YAML_FIELDS_KEY]};
-      auto result{hdr.parse_fields(field_list_node)};
-      if (!result.is_ok()) {
-        errata.error("Failed to parse response at {}", node.Mark());
-        errata.note(result);
-      }
-    }
-  }
-
-  return errata;
-}
-
 swoc::Errata ClientReplayFileHandler::proxy_response(YAML::Node const &node) {
   if (!Proxy_Mode) {
-    return this->handle_response(node, _txn._rsp);
+    return _txn._rsp.load(node);
   }
   return {};
 }
 
 swoc::Errata ClientReplayFileHandler::server_response(YAML::Node const &node) {
   if (Proxy_Mode) {
-    return this->handle_response(node, _txn._rsp);
+    return _txn._rsp.load(node);
   }
   return {};
 }
@@ -139,8 +102,76 @@ swoc::Errata ClientReplayFileHandler::ssn_close() {
   return {};
 }
 
-swoc::Errata Run_Transaction(int fd, Txn const &txn) {
-  auto result = txn._req.transmit(fd);
+swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
+  swoc::Errata errata{txn._req.transmit(fd)};
+  if (errata.is_ok()) {
+    size_t eoh_offset = 0;
+    HttpHeader rsp_hdr;
+    swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+    while (w.remaining() > 0) {
+      auto n = read(fd, w.aux_data(), w.remaining());
+      if (n > 0) {
+        size_t start =
+            std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
+        w.commit(n);
+        size_t offset = w.view().substr(start).find(HTTP_EOH);
+        if (TextView::npos != offset) {
+          eoh_offset = start + offset + HTTP_EOH.size();
+          break;
+        }
+      } else if (EINTR != errno) {
+        errata.error(
+            R"(Connection closed unexpectedly while waiting for response header - {}.)",
+            swoc::bwf::Errno{});
+        break;
+      }
+    }
+
+    if (eoh_offset) {
+      auto result{rsp_hdr.parse_response(w.view().substr(0, eoh_offset))};
+      if (result.is_ok()) {
+        size_t left_overs = w.size() - eoh_offset;
+        // soak up content.
+        std::string buff;
+        size_t content_length = std::numeric_limits<size_t>::max();
+        if (auto spot{rsp_hdr._fields.find(HttpHeader::FIELD_CONTENT_LENGTH)};
+            spot != rsp_hdr._fields.end()) {
+          content_length = swoc::svtou(spot->second);
+          if (content_length < left_overs) {
+            errata.error(
+                R"(Response overrun - received {} bytes of content, expected {}.)",
+                left_overs, content_length);
+            return errata;
+          }
+          content_length -= left_overs;
+        }
+        buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
+
+        size_t body_size = 0;
+        while (body_size < content_length) {
+          size_t n =
+              read(fd, buff.data(),
+                   std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE));
+          if (n <= 0) {
+            if (content_length != std::numeric_limits<size_t>::max()) {
+              errata.error(
+                  R"(Response underrun - recieved {} bytes of content, expected {}, when file closed because {}.)",
+                  body_size, content_length, swoc::bwf::Errno{});
+            }
+            eos_p = true;
+            break;
+          }
+          body_size += n;
+        }
+      } else {
+        errata.error(R"(Invalid response.)");
+        errata.note(result);
+      }
+    } else {
+      errata.error(R"(Response exceeded maximum size {}.)", MAX_RSP_HDR_SIZE);
+    }
+  }
+  return errata;
 }
 
 swoc::Errata Run_Session(Session const &ssn, swoc::IPEndpoint const &target) {
@@ -150,8 +181,18 @@ swoc::Errata Run_Session(Session const &ssn, swoc::IPEndpoint const &target) {
   if (socket_fd >= 0) {
     int connect_result = connect(socket_fd, &target.sa, target.size());
     if (0 == connect_result) {
+      bool eos_p = false; // end of stream during a transaction.
       for (auto const &txn : ssn) {
-        Run_Transaction(socket_fd, txn);
+        if (eos_p) {
+          errata.error(
+              R"(Session closed before all transactions were processed.)");
+          break;
+        }
+        errata = Run_Transaction(socket_fd, txn, eos_p);
+        if (!errata.is_ok()) {
+          close(socket_fd);
+          break;
+        }
       }
     } else {
       errata.error(R"(Failed to connect to {} - {}.)", target,

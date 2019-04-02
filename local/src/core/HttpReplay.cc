@@ -37,6 +37,18 @@ HttpHeader::NameSet HttpHeader::_names;
 HttpHeader::Binding HttpHeader::_binding;
 swoc::TextView HttpHeader::_key_format{"{field.uuid}"};
 swoc::MemSpan<char> HttpHeader::_content;
+swoc::TextView HttpHeader::FIELD_CONTENT_LENGTH;
+
+namespace {
+[[maybe_unused]] bool INITIALIZED = []() -> bool {
+  HttpHeader::global_init();
+  return true;
+}();
+}
+
+void HttpHeader::global_init() {
+  FIELD_CONTENT_LENGTH = localize("Content-Length");
+}
 
 void HttpHeader::set_max_content_length(size_t n) {
   n = swoc::round_up<16>(n);
@@ -61,7 +73,7 @@ swoc::Errata HttpHeader::transmit(int fd) const {
     write(fd, _content.data(), _content_size);
   } else if (_method) {
     swoc::LocalBufferWriter<MAX_REQ_HDR_SIZE> w;
-    w.print("{} {} HTTP/{}{}", _method, _url, _http_version);
+    w.print("{} {} HTTP/{}{}", _method, _url, _http_version, HTTP_EOL);
     for (auto const &[name, value] : _fields) {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
@@ -142,6 +154,16 @@ swoc::Errata HttpHeader::load(YAML::Node const &node) {
     }
   }
 
+  if (node[YAML_HTTP_URL_KEY]) {
+    auto url_node{node[YAML_HTTP_URL_KEY]};
+    if (url_node.IsScalar()) {
+      _url = url_node.Scalar();
+    } else {
+      errata.error(R"("{}" value at {} must a string.)", YAML_HTTP_URL_KEY,
+                   url_node.Mark());
+    }
+  }
+
   if (node[YAML_CONTENT_KEY]) {
     auto content_node{node[YAML_CONTENT_KEY]};
     if (content_node.IsMap()) {
@@ -192,7 +214,7 @@ swoc::TextView HttpHeader::localize(TextView text) {
     return *spot;
   } else if (!_frozen) {
     auto span{_arena.alloc(text.size()).rebind<char>()};
-    memcpy(span.data(), text.data(), text.size());
+    std::transform(text.begin(), text.end(), span.begin(), &tolower);
     TextView local{span.data(), text.size()};
     _names.insert(local);
     return local;
@@ -216,7 +238,42 @@ HttpHeader::parse_request(swoc::TextView data) {
       }
 
       while (data) {
-        auto field{data.take_prefix_at('\n')};
+        auto field{data.take_prefix_at('\n').rtrim_if(&isspace)};
+        if (field.empty()) {
+          continue;
+        }
+        auto value{field};
+        auto name{this->localize(value.take_prefix_at(':'))};
+        value.trim_if(&isspace);
+        if (name) {
+          _fields[name] = value;
+        } else {
+          zret = PARSE_ERROR;
+          zret.errata().error(R"(Malformed field "{}".)", field);
+        }
+      }
+    } else {
+      zret = PARSE_ERROR;
+      zret.errata().error("Empty first line in request.");
+    }
+  }
+  return zret;
+}
+
+swoc::Rv<HttpHeader::ParseResult>
+HttpHeader::parse_response(swoc::TextView data) {
+  swoc::Rv<ParseResult> zret;
+  auto eoh = data.find(HTTP_EOH);
+
+  if (swoc::TextView::npos == eoh) {
+    zret = PARSE_INCOMPLETE;
+  } else {
+    data = data.prefix(eoh);
+
+    auto first_line{data.take_prefix_at('\n').rtrim_if(&isspace)};
+    if (first_line) {
+      while (data) {
+        auto field{data.take_prefix_at('\n').rtrim_if(&isspace)};
         if (field.empty()) {
           continue;
         }
@@ -232,7 +289,7 @@ HttpHeader::parse_request(swoc::TextView data) {
       }
     } else {
       zret = PARSE_ERROR;
-      zret.errata().error("Empty first line in request.");
+      zret.errata().error("Empty first line in response.");
     }
   }
   return zret;
@@ -375,6 +432,7 @@ Load_Replay_Directory(swoc::file::path const &path,
         }
       };
 
+      std::cout << "Loading " << n_sessions << " replay files." << std::endl;
       std::vector<std::thread> threads;
       threads.reserve(n_threads);
       for (int tidx = 0; tidx < n_threads; ++tidx) {

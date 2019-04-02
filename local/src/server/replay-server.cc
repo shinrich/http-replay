@@ -1,11 +1,13 @@
 #include <array>
 #include <atomic>
+#include <csignal>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
+#include <bits/signum.h>
 #include <dirent.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -93,49 +95,59 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
 }
 
 void TF_Serve(int socket_fd) {
+  swoc::Errata errata;
   swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
   bool done_p = false;
-  while (!done_p) {
+  while (errata.is_ok()) {
+    size_t eoh_offset = 0;
     HttpHeader req_hdr;
-    swoc::Errata errata;
-    ssize_t n;
-    w.clear();
+
     while (w.remaining() > 0) {
-      n = read(socket_fd, w.aux_data(), w.remaining());
+      auto n = read(socket_fd, w.aux_data(), w.remaining());
       if (n > 0) {
-        size_t offset =
+        size_t start =
             std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
         w.commit(n);
-        if (TextView::npos == w.view().substr(offset).find(HTTP_EOH)) {
-          continue;
+        size_t offset = w.view().substr(start).find(HTTP_EOH);
+        if (TextView::npos != offset) {
+          eoh_offset = start + offset + HTTP_EOH.size();
+          break; // full header has arrived.
         }
-        auto result{req_hdr.parse_request(w.view())};
-        if (result.is_ok()) {
-          auto key{req_hdr.make_key()};
-          auto spot{Transactions.find(key)};
-          if (spot != Transactions.end()) {
-            spot->second.transmit(socket_fd);
-          } else {
-            errata.error(R"(Proxy request with key "{}" not found.)", key);
-            done_p = true;
-            break;
-          }
-        } else {
-          errata.error(R"(Proxy request was malformed.)");
-          errata.note(result);
-          done_p = true;
-          break;
+      } else if (EINTR != errno) {
+        if (w.size() > 0) {
+          errata.error(
+              R"(Connection closed unexpectedly after {} bytes while waiting for request header - {}.)",
+              w.size(), swoc::bwf::Errno{});
+          w.clear();
         }
-      } else {
-        if (errno != EINTR) {
-          done_p = true;
-          break;
-        }
+        break;
       }
     }
-    if (!errata.is_ok()) {
-      std::cerr << errata;
+
+    if (eoh_offset) {
+      auto result{req_hdr.parse_request(w.view())};
+      if (result.is_ok()) {
+        auto key{req_hdr.make_key()};
+        auto spot{Transactions.find(key)};
+        if (spot != Transactions.end()) {
+          spot->second.transmit(socket_fd);
+          w.clear();
+        } else {
+          errata.error(R"(Proxy request with key "{}" not found.)", key);
+        }
+      } else {
+        errata.error(R"(Proxy request was malformed.)");
+        errata.note(result);
+      }
+    } else if (w.size()) {
+      errata.error(R"(Response exceeded maximum size {}.)", MAX_REQ_HDR_SIZE);
+    } else {
+      break; // clean close from client, after a complete transaction.
     }
+  }
+
+  if (!errata.is_ok()) {
+    std::cerr << errata;
   }
   close(socket_fd);
 }
@@ -246,6 +258,8 @@ int main(int argc, const char *argv[]) {
                    "", 1, [&]() -> void { engine.command_run(); })
       .add_option("--listen", "", "Listen address and port", "", 1,
                   "127.0.0.1:8080");
+
+  ::signal(SIGPIPE, SIG_IGN);
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
