@@ -1,5 +1,6 @@
 #include <dirent.h>
 
+#include <chrono>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -8,6 +9,14 @@
 #include "core/ArgParser.h"
 #include "core/HttpReplay.h"
 #include "swoc/bwf_ex.h"
+#include "swoc/bwf_ip.h"
+
+namespace swoc {
+inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
+                              std::chrono::milliseconds ms) {
+  return bwformat(w, spec, ms.count()).write("ms");
+}
+} // namespace swoc
 
 using swoc::TextView;
 
@@ -16,14 +25,19 @@ struct Txn {
   HttpHeader _rsp; ///< Response to expect.
 };
 
-using Session = std::list<Txn>;
+struct Ssn {
+  std::list<Txn> _txn;
+  std::string _path;
+  unsigned _line_no = 0;
+};
 std::mutex LoadMutex;
 
-std::list<Session> Session_List;
+std::list<Ssn> Session_List;
 
 bool Proxy_Mode = false;
 
 class ClientReplayFileHandler : public ReplayFileHandler {
+  swoc::Errata file_open(swoc::file::path const &path);
   swoc::Errata ssn_open(YAML::Node const &node) override;
   swoc::Errata txn_open(YAML::Node const &node) override;
   swoc::Errata client_request(YAML::Node const &node) override;
@@ -36,13 +50,19 @@ class ClientReplayFileHandler : public ReplayFileHandler {
   void txn_reset();
   void ssn_reset();
 
-  Session _ssn;
+  std::string _path;
+  Ssn _ssn;
   Txn _txn;
 };
 
+swoc::Errata ClientReplayFileHandler::file_open(swoc::file::path const &path) {
+  _path = path.string();
+  return {};
+}
+
 void ClientReplayFileHandler::ssn_reset() {
-  _ssn.~Session();
-  new (&_ssn) Session;
+  _ssn.~Ssn();
+  new (&_ssn) Ssn;
 }
 
 void ClientReplayFileHandler::txn_reset() {
@@ -50,7 +70,9 @@ void ClientReplayFileHandler::txn_reset() {
   new (&_txn) Txn;
 }
 
-swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &) {
+swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
+  _ssn._path = _path;
+  _ssn._line_no = node.Mark().line;
   return {};
 }
 
@@ -88,7 +110,7 @@ swoc::Errata ClientReplayFileHandler::server_response(YAML::Node const &node) {
 }
 
 swoc::Errata ClientReplayFileHandler::txn_close() {
-  _ssn.emplace_back(std::move(_txn));
+  _ssn._txn.emplace_back(std::move(_txn));
   LoadMutex.unlock();
   return {};
 }
@@ -103,6 +125,7 @@ swoc::Errata ClientReplayFileHandler::ssn_close() {
 }
 
 swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
+  std::cout << "Transaction" << std::endl;
   swoc::Errata errata{txn._req.transmit(fd)};
   if (errata.is_ok()) {
     size_t eoh_offset = 0;
@@ -123,6 +146,7 @@ swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
         errata.error(
             R"(Connection closed unexpectedly while waiting for response header - {}.)",
             swoc::bwf::Errno{});
+        eos_p = true;
         break;
       }
     }
@@ -167,39 +191,50 @@ swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
         errata.error(R"(Invalid response.)");
         errata.note(result);
       }
-    } else {
+    } else if (errata.is_ok()) {
       errata.error(R"(Response exceeded maximum size {}.)", MAX_RSP_HDR_SIZE);
     }
   }
   return errata;
 }
 
-swoc::Errata Run_Session(Session const &ssn, swoc::IPEndpoint const &target) {
+swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
   swoc::Errata errata;
+  int socket_fd = -2;
 
-  int socket_fd = socket(target.family(), SOCK_STREAM, 0);
-  if (socket_fd >= 0) {
-    int connect_result = connect(socket_fd, &target.sa, target.size());
-    if (0 == connect_result) {
-      bool eos_p = false; // end of stream during a transaction.
-      for (auto const &txn : ssn) {
-        if (eos_p) {
-          errata.error(
-              R"(Session closed before all transactions were processed.)");
-          break;
-        }
-        errata = Run_Transaction(socket_fd, txn, eos_p);
-        if (!errata.is_ok()) {
-          close(socket_fd);
-          break;
-        }
-      }
-    } else {
-      errata.error(R"(Failed to connect to {} - {}.)", target,
-                   swoc::bwf::Errno{});
+  std::cout << "Session" << std::endl;
+
+  for (auto const &txn : ssn._txn) {
+    if (-1 == socket_fd) {
+      errata.info(
+          R"(Session ["{}":{}] closed before all transactions completed.)",
+          ssn._path, ssn._line_no);
     }
-  } else {
-    errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+    if (0 > socket_fd) {
+      socket_fd = socket(target.family(), SOCK_STREAM, 0);
+      if (socket_fd >= 0) {
+        if (0 != connect(socket_fd, &target.sa, target.size())) {
+          errata.error(R"(Failed to connect to {} - {}.)", target,
+                       swoc::bwf::Errno{});
+          break;
+        }
+      } else {
+        errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+        break;
+      }
+    }
+    bool eos_p = false;
+    errata = Run_Transaction(socket_fd, txn, eos_p);
+    if (eos_p) {
+      close(socket_fd);
+      socket_fd = -1;
+    }
+    if (!errata.is_ok()) {
+      break;
+    }
+  }
+  if (0 <= socket_fd) {
+    close(socket_fd);
   }
   return std::move(errata);
 }
@@ -258,12 +293,28 @@ void Engine::command_run() {
     return;
   }
 
+  auto start = std::chrono::high_resolution_clock::now();
+  unsigned n_ssn = 0;
+  unsigned n_txn = 0;
   for (auto const &ssn : Session_List) {
     result = Run_Session(ssn, target);
     if (!result.is_ok()) {
       std::cerr << result;
+      break;
     }
+    if (result.count()) {
+      std::cout << result;
+    }
+    ++n_ssn;
+    n_txn += ssn._txn.size();
   }
+  auto delta = std::chrono::high_resolution_clock::now() - start;
+  std::cout << swoc::LocalBufferWriter<256>{}
+                   .print("{} transactions in {} sessions in {}.", n_ssn, n_txn,
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              delta))
+                   .view()
+            << std::endl;
 };
 
 int main(int argc, const char *argv[]) {
@@ -287,6 +338,5 @@ int main(int argc, const char *argv[]) {
   if (!engine.erratum.is_ok()) {
     std::cerr << engine.erratum;
   }
-  std::cout << "Ready" << std::endl;
   return engine.status_code;
 }

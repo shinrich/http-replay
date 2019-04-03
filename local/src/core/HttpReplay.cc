@@ -48,6 +48,7 @@ namespace {
 
 void HttpHeader::global_init() {
   FIELD_CONTENT_LENGTH = localize("Content-Length");
+  FIELD_TRANSFER_ENCODING = localize("Transfer-Encoding");
 }
 
 void HttpHeader::set_max_content_length(size_t n) {
@@ -69,8 +70,19 @@ swoc::Errata HttpHeader::transmit(int fd) const {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
     w.write(HTTP_EOL);
-    write(fd, w.data(), w.size());
-    write(fd, _content.data(), _content_size);
+    size_t n = write(fd, w.data(), w.size());
+    if (n == w.size()) {
+      n = write(fd, _content.data(), _content_size);
+      if (n == _content_size) {
+
+      } else {
+        errata.error(R"(Body write failed - {} of {} bytes written - {}.)", n,
+                     _content_size, swoc::bwf::Errno{});
+      }
+    } else {
+      errata.error(R"(Header write failed - {} of {} bytes written - {}.)", n,
+                   w.size(), swoc::bwf::Errno{});
+    }
   } else if (_method) {
     swoc::LocalBufferWriter<MAX_REQ_HDR_SIZE> w;
     w.print("{} {} HTTP/{}{}", _method, _url, _http_version, HTTP_EOL);
@@ -78,9 +90,13 @@ swoc::Errata HttpHeader::transmit(int fd) const {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
     w.write(HTTP_EOL);
-    write(fd, w.data(), w.size());
+    size_t n = write(fd, w.data(), w.size());
+    if (n != w.size()) {
+      errata.error(R"(Header write failed - {} of {} bytes written - {}.)", n,
+                   w.size(), swoc::bwf::Errno{});
+    }
   } else {
-    errata.error(R"(Transmit failed - no status nor method.)");
+    errata.error(R"(Unable to write header - no status nor method.)");
   }
   return errata;
 }
@@ -90,13 +106,14 @@ swoc::Errata HttpHeader::parse_fields(YAML::Node const &field_list_node) {
 
   for (auto const &field_node : field_list_node) {
     if (field_node.IsSequence()) {
-      if (field_node.size() == 2) {
+      if (2 <= field_node.size() && field_node.size() <= 3) {
         TextView name{this->localize(field_node[0].Scalar())};
         TextView value{field_node[1].Scalar()};
         _fields[name] = value;
       } else {
-        errata.error("Field at {} is not a sequence of length 2 as required.",
-                     field_node.Mark());
+        errata.error(
+            "Field at {} is not a sequence of length 2 or 3 as required.",
+            field_node.Mark());
       }
     } else {
       errata.error("Field at {} is not a sequence as required.",
@@ -316,82 +333,86 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
                               ReplayFileHandler &handler) {
   swoc::Errata errata;
   std::error_code ec;
-  std::string content{swoc::file::load(path, ec)};
-  if (ec.value()) {
-    errata.error(R"(Error loading "{}": {})", path, ec);
-  } else {
-    YAML::Node root;
-    try {
-      root = YAML::Load(content);
-    } catch (std::exception const &ex) {
-      errata.error(R"(Exception: {} in "{}".)", ex.what(), path);
-    }
-    if (errata.is_ok()) {
-      if (root[YAML_SSN_KEY]) {
-        auto ssn_list_node{root[YAML_SSN_KEY]};
-        if (ssn_list_node.IsSequence()) {
-          if (ssn_list_node.size() > 0) {
-            for (auto const &ssn_node : ssn_list_node) {
-              if (ssn_node[YAML_TXN_KEY]) {
-                auto txn_list_node{ssn_node[YAML_TXN_KEY]};
-                if (txn_list_node.IsSequence()) {
-                  if (txn_list_node.size() > 0) {
-                    auto result{handler.ssn_open(txn_list_node)};
-                    if (result.is_ok()) {
-                      for (auto const &txn_node : txn_list_node) {
-                        if (txn_node[YAML_PROXY_REQ_KEY] &&
-                            txn_node[YAML_SERVER_RSP_KEY] &&
-                            txn_node[YAML_CLIENT_REQ_KEY] &&
-                            txn_node[YAML_PROXY_RSP_KEY]) {
-                          result.note(handler.txn_open(txn_node));
-                          if (result.is_ok()) {
-                            result.note(handler.client_request(
-                                txn_node[YAML_CLIENT_REQ_KEY]));
-                            result.note(handler.proxy_request(
-                                txn_node[YAML_PROXY_REQ_KEY]));
-                            result.note(handler.server_response(
-                                txn_node[YAML_SERVER_RSP_KEY]));
-                            result.note(handler.proxy_response(
-                                txn_node[YAML_PROXY_RSP_KEY]));
-                            result.note(handler.txn_close());
+  errata = handler.file_open(path);
+  if (errata.is_ok()) {
+    std::string content{swoc::file::load(path, ec)};
+    if (ec.value()) {
+      errata.error(R"(Error loading "{}": {})", path, ec);
+    } else {
+      YAML::Node root;
+      try {
+        root = YAML::Load(content);
+      } catch (std::exception const &ex) {
+        errata.error(R"(Exception: {} in "{}".)", ex.what(), path);
+      }
+      if (errata.is_ok()) {
+        if (root[YAML_SSN_KEY]) {
+          auto ssn_list_node{root[YAML_SSN_KEY]};
+          if (ssn_list_node.IsSequence()) {
+            if (ssn_list_node.size() > 0) {
+              for (auto const &ssn_node : ssn_list_node) {
+                if (ssn_node[YAML_TXN_KEY]) {
+                  auto txn_list_node{ssn_node[YAML_TXN_KEY]};
+                  if (txn_list_node.IsSequence()) {
+                    if (txn_list_node.size() > 0) {
+                      auto result{handler.ssn_open(txn_list_node)};
+                      if (result.is_ok()) {
+                        for (auto const &txn_node : txn_list_node) {
+                          if (txn_node[YAML_PROXY_REQ_KEY] &&
+                              txn_node[YAML_SERVER_RSP_KEY] &&
+                              txn_node[YAML_CLIENT_REQ_KEY] &&
+                              txn_node[YAML_PROXY_RSP_KEY]) {
+                            result.note(handler.txn_open(txn_node));
+                            if (result.is_ok()) {
+                              result.note(handler.client_request(
+                                  txn_node[YAML_CLIENT_REQ_KEY]));
+                              result.note(handler.proxy_request(
+                                  txn_node[YAML_PROXY_REQ_KEY]));
+                              result.note(handler.server_response(
+                                  txn_node[YAML_SERVER_RSP_KEY]));
+                              result.note(handler.proxy_response(
+                                  txn_node[YAML_PROXY_RSP_KEY]));
+                              result.note(handler.txn_close());
+                            }
+                            errata = std::move(result);
+                          } else {
+                            errata.error(
+                                R"(Transaction node at {} in "{}" did not contain all four required HTTP header keys.)",
+                                txn_node.Mark(), path);
                           }
-                          errata = std::move(result);
-                        } else {
-                          errata.error(
-                              R"(Transaction node at {} in "{}" did not contain all four required HTTP header keys.)",
-                              txn_node.Mark(), path);
                         }
+                        result.note(handler.ssn_close());
                       }
-                      result.note(handler.ssn_close());
+                      errata.note(result);
+                    } else {
+                      errata.info(
+                          R"(Transaction list at {} in session at {} in "{}" is an empty list.)",
+                          txn_list_node.Mark(), ssn_node.Mark(), path);
                     }
-                    errata.note(result);
                   } else {
-                    errata.info(
-                        R"(Transaction list at {} in session at {} in "{}" is an empty list.)",
+                    errata.error(
+                        R"(Transaction list at {} in session at {} in "{}" is not a list.)",
                         txn_list_node.Mark(), ssn_node.Mark(), path);
                   }
                 } else {
-                  errata.error(
-                      R"(Transaction list at {} in session at {} in "{}" is not a list.)",
-                      txn_list_node.Mark(), ssn_node.Mark(), path);
+                  errata.error(R"(Session at {} in "{}" has no "{}" key.)",
+                               ssn_node.Mark(), path, YAML_TXN_KEY);
                 }
-              } else {
-                errata.error(R"(Session at {} in "{}" has no "{}" key.)",
-                             ssn_node.Mark(), path, YAML_TXN_KEY);
               }
+            } else {
+              errata.info(R"(Session list at {} in "{}" is an empty list.)",
+                          ssn_list_node.Mark(), path);
             }
           } else {
-            errata.info(R"(Session list at {} in "{}" is an empty list.)",
-                        ssn_list_node.Mark(), path);
+            errata.error(R"("{}" value at {} in "{}" is not a sequence.)",
+                         YAML_SSN_KEY, ssn_list_node.Mark(), path);
           }
         } else {
-          errata.error(R"("{}" value at {} in "{}" is not a sequence.)",
-                       YAML_SSN_KEY, ssn_list_node.Mark(), path);
+          errata.error(R"(Failed to parse "{}".)", path.c_str());
         }
-      } else {
-        errata.error(R"(Failed to parse "{}".)", path.c_str());
       }
     }
+    handler.file_close();
   }
   return errata;
 }

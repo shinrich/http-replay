@@ -72,6 +72,7 @@ public:
   enum ParseResult { PARSE_OK, PARSE_ERROR, PARSE_INCOMPLETE };
 
   static TextView FIELD_CONTENT_LENGTH;
+  static TextView FIELD_TRANSFER_ENCODING;
 
   /** Write the header to @a fd.
    *
@@ -164,6 +165,8 @@ inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
 
 class ReplayFileHandler {
 public:
+  virtual swoc::Errata file_open(swoc::file::path const &path) { return {}; }
+  virtual swoc::Errata file_close() { return {}; }
   virtual swoc::Errata ssn_open(YAML::Node const &node) { return {}; }
   virtual swoc::Errata ssn_close() { return {}; }
   virtual swoc::Errata txn_open(YAML::Node const &node) { return {}; }

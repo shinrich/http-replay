@@ -49,8 +49,12 @@ bool Shutdown_Flag = false;
 
 std::mutex LoadMutex;
 
-std::unordered_map<std::string, HttpHeader, std::hash<std::string_view>>
-    Transactions;
+struct Txn {
+  HttpHeader _req;
+  HttpHeader _rsp;
+};
+
+std::unordered_map<std::string, Txn, std::hash<std::string_view>> Transactions;
 
 class ServerReplayFileHandler : public ReplayFileHandler {
   swoc::Errata txn_open(YAML::Node const &node) override;
@@ -60,13 +64,13 @@ class ServerReplayFileHandler : public ReplayFileHandler {
 
   void reset();
 
-  std::string key;
-  HttpHeader server_hdr;
+  std::string _key;
+  Txn _txn;
 };
 
 void ServerReplayFileHandler::reset() {
-  server_hdr.~HttpHeader();
-  new (&server_hdr) HttpHeader;
+  _txn.~Txn();
+  new (&_txn) Txn;
 }
 
 swoc::Errata ServerReplayFileHandler::txn_open(YAML::Node const &) {
@@ -75,20 +79,39 @@ swoc::Errata ServerReplayFileHandler::txn_open(YAML::Node const &) {
 }
 
 swoc::Errata ServerReplayFileHandler::proxy_request(YAML::Node const &node) {
-  HttpHeader hdr;
-  swoc::Errata errata = hdr.load(node);
+  swoc::Errata errata = _txn._req.load(node);
   if (errata.is_ok()) {
-    key = hdr.make_key();
+    _key = _txn._req.make_key();
   }
   return errata;
 }
 
 swoc::Errata ServerReplayFileHandler::server_response(YAML::Node const &node) {
-  return server_hdr.load(node);
+  auto errata{_txn._rsp.load(node)};
+  if (errata.is_ok()) {
+    if (auto spot{_txn._rsp._fields.find(HttpHeader::FIELD_CONTENT_LENGTH)};
+        spot != _txn._rsp._fields.end()) {
+      TextView src{spot->second}, parsed;
+      auto cl = swoc::svtou(src, &parsed);
+      if (parsed.size() == src.size()) {
+        if (_txn._rsp._content_size != cl) {
+          errata.info(
+              R"(Overriding content size () with "{}" header value {} at {}.)",
+              _txn._rsp._content_size, HttpHeader::FIELD_CONTENT_LENGTH, cl,
+              node.Mark());
+          _txn._rsp._content_size = cl;
+        }
+      } else {
+        errata.info(R"(Invalid "{}" field at {} - not a positive integer.)",
+                    HttpHeader::FIELD_CONTENT_LENGTH, node.Mark());
+      }
+    }
+  }
+  return errata;
 }
 
 swoc::Errata ServerReplayFileHandler::txn_close() {
-  Transactions[key] = std::move(server_hdr);
+  Transactions[_key] = std::move(_txn);
   LoadMutex.unlock();
   this->reset();
   return {};
@@ -96,14 +119,16 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
 
 void TF_Serve(int socket_fd) {
   swoc::Errata errata;
-  swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
   bool done_p = false;
+
   while (errata.is_ok()) {
     size_t eoh_offset = 0;
     HttpHeader req_hdr;
+    swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
 
     while (w.remaining() > 0) {
       auto n = read(socket_fd, w.aux_data(), w.remaining());
+      std::cout << "Read " << n << " bytes" << std::endl;
       if (n > 0) {
         size_t start =
             std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
@@ -130,8 +155,15 @@ void TF_Serve(int socket_fd) {
         auto key{req_hdr.make_key()};
         auto spot{Transactions.find(key)};
         if (spot != Transactions.end()) {
-          spot->second.transmit(socket_fd);
-          w.clear();
+          [[maybe_unused]] auto const &[key, hdr] = *spot;
+          errata = hdr.transmit(socket_fd);
+          if (errata.is_ok()) {
+            //            if (hdr._fields.end() ==
+            //            hdr._fields.find(HttpHeader::FIELD_CONTENT_LENGTH)) {
+            //              break; // no CL, have to close to signal end of
+            //              data, but it's not an error.
+            //            }
+          }
         } else {
           errata.error(R"(Proxy request with key "{}" not found.)", key);
         }
@@ -258,8 +290,6 @@ int main(int argc, const char *argv[]) {
                    "", 1, [&]() -> void { engine.command_run(); })
       .add_option("--listen", "", "Listen address and port", "", 1,
                   "127.0.0.1:8080");
-
-  ::signal(SIGPIPE, SIG_IGN);
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
