@@ -63,6 +63,60 @@ static constexpr swoc::TextView HTTP_EOL{"\r\n"};
 /// HTTP end of header.
 static constexpr swoc::TextView HTTP_EOH{"\r\n\r\n"};
 
+class ChunkCodex {
+public:
+  /// The callback when a chunk is decoded.
+  /// @param chunk Data for the chunk in the provided view.
+  /// @param offset The offset from the full chunk for @a chunk.
+  /// @param size The size of the full chunk.
+  /// Because the data provided might not contain the entire chunk, a chunk can
+  /// come back piecemeal in the callbacks. The @a offset and @a size specify
+  /// where in the actual chunk the particular piece in @a chunk is placed.
+  using ChunkCallback = std::function<bool(swoc::TextView chunk, size_t offset, size_t size)>;
+  enum Result { CONTINUE, DONE, ERROR };
+
+  /** Parse @a data as chunked encoded.
+   *
+   * @param data Data to parse.
+   * @param cb Callback to receive decoded chunks.
+   * @return Parsing result.
+   *
+   * The parsing is designed to be restartable so that data can be passed
+   * directly from the socket to this object, without doing any gathering.
+   */
+  Result parse(swoc::TextView data, ChunkCallback const &cb);
+
+  /** Write @a data to @a fd using chunked encoding.
+   *
+   * @param fd Output file descriptor.
+   * @param data [in,out] Data to write.
+   * @param chunk_size Size of chunks.
+   * @return A pair of
+   *   - The number of bytes written from @a data (not including the chunk
+   * encoding).
+   *   - An error code, which will be 0 if all data was successfully written.
+   */
+  std::tuple<ssize_t, std::error_code> transmit(int fd, swoc::TextView data,
+                                               size_t chunk_size = 4096);
+
+protected:
+  size_t _size = 0; ///< Size of the current chunking being decoded.
+  size_t _off =
+      0; ///< Number of bytes in the current chunk already sent to the callback.
+  /// Buffer to hold size text in case it falls across @c parse call boundaries.
+  swoc::LocalBufferWriter<8> _size_text;
+
+  /// Parsing state.
+  enum class State {
+    INIT, ///< Initial state, no parsing has occurred.
+    SIZE, ///< Parsing the chunk size.
+    CR,   ///< Expecting the size terminating CR
+    LF,   ///< Expecting the size terminating LF.
+    BODY, ///< Inside the chunk body.
+    FINAL ///< Terminating (size zero) chunk parsed.
+  } _state = State::INIT;
+};
+
 class HttpHeader {
   using Fields = std::unordered_map<swoc::TextView, std::string,
                                     std::hash<std::string_view>>;
@@ -74,17 +128,38 @@ public:
   static TextView FIELD_CONTENT_LENGTH;
   static TextView FIELD_TRANSFER_ENCODING;
 
+  static std::bitset<600> STATUS_NO_CONTENT;
+
   /** Write the header to @a fd.
    *
    * @param fd Ouput stream.
    */
-  swoc::Errata transmit(int fd) const;
+  swoc::Errata transmit(int &fd) const;
+
+  swoc::Errata transmit_body(int &fd) const;
+
+  /** Drain the content.
+   *
+   * @param fd [in,out]File to read. This is changed to -1 if closed while draining.
+   * @param initial Initial part of the body.
+   * @return Errors, if any.
+   *
+   * If the return is an error, @a fd should be closed. It can be the case @a fd is closed
+   * without an error, @a fd must be checked after the call to detect this.
+   *
+   * @a initial is needed for cases where part of the content is captured while trying to read
+   * the header.
+   */
+  swoc::Errata drain_body(int &fd, TextView initial) const;
 
   swoc::Errata load(YAML::Node const &node);
   swoc::Errata parse_fields(YAML::Node const &field_list_node);
 
   swoc::Rv<ParseResult> parse_request(TextView data);
   swoc::Rv<ParseResult> parse_response(TextView data);
+
+  swoc::Errata update_content_length();
+  swoc::Errata update_transfer_encoding();
 
   std::string make_key();
 
@@ -95,6 +170,11 @@ public:
   TextView _http_version;
   std::string _url;
   Fields _fields;
+
+  /// Body is chunked.
+  unsigned _chunked_p : 1;
+  /// No Content-Length - close after sending body.
+  unsigned _content_length_p : 1;
 
   /// Format string to generate a key from a transaction.
   static TextView _key_format;

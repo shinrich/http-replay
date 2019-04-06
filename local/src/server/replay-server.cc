@@ -121,7 +121,7 @@ void TF_Serve(int socket_fd) {
   swoc::Errata errata;
   bool done_p = false;
 
-  while (errata.is_ok()) {
+  while (socket_fd >= 0 && errata.is_ok()) {
     size_t eoh_offset = 0;
     HttpHeader req_hdr;
     swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
@@ -150,20 +150,22 @@ void TF_Serve(int socket_fd) {
     }
 
     if (eoh_offset) {
+      std::cout << "Read request" << std::endl;
       auto result{req_hdr.parse_request(w.view())};
       if (result.is_ok()) {
+        std::cout << "Handling request" << std::endl;
         auto key{req_hdr.make_key()};
         auto spot{Transactions.find(key)};
         if (spot != Transactions.end()) {
-          [[maybe_unused]] auto const &[key, hdr] = *spot;
-          errata = hdr.transmit(socket_fd);
-          if (errata.is_ok()) {
-            //            if (hdr._fields.end() ==
-            //            hdr._fields.find(HttpHeader::FIELD_CONTENT_LENGTH)) {
-            //              break; // no CL, have to close to signal end of
-            //              data, but it's not an error.
-            //            }
+          [[maybe_unused]] auto const &[key, txn] = *spot;
+          req_hdr.update_content_length();
+          req_hdr.update_transfer_encoding();
+          if (req_hdr._content_length_p) {
+            std::cout << "Draining request" << std::endl;
+            errata = req_hdr.drain_body(socket_fd, w.view().substr(eoh_offset));
           }
+          std::cout << "Responding " << txn._rsp._status << std::endl;
+          errata = txn._rsp.transmit(socket_fd);
         } else {
           errata.error(R"(Proxy request with key "{}" not found.)", key);
         }
@@ -181,7 +183,9 @@ void TF_Serve(int socket_fd) {
   if (!errata.is_ok()) {
     std::cerr << errata;
   }
-  close(socket_fd);
+  if (socket_fd >= 0) {
+    close(socket_fd);
+  }
 }
 
 void TF_Accept(int socket_fd) {
@@ -245,9 +249,9 @@ void Engine::command_run() {
   // error instead if not found.
   HttpHeader::_frozen = true;
   size_t max_content_length = 0;
-  for (auto const &[key, value] : Transactions) {
+  for (auto const &[key, txn] : Transactions) {
     max_content_length =
-        std::max<size_t>(max_content_length, value._content_size);
+        std::max<size_t>(max_content_length, txn._rsp._content_size);
   }
   HttpHeader::set_max_content_length(max_content_length);
 

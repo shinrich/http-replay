@@ -124,13 +124,15 @@ swoc::Errata ClientReplayFileHandler::ssn_close() {
   return {};
 }
 
-swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
+swoc::Errata Run_Transaction(int &fd, Txn const &txn) {
   std::cout << "Transaction" << std::endl;
   swoc::Errata errata{txn._req.transmit(fd)};
+  std::cout << "Request sent" << std::endl;
   if (errata.is_ok()) {
     size_t eoh_offset = 0;
     HttpHeader rsp_hdr;
     swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+    std::cout << "Reading response header" << std::endl;
     while (w.remaining() > 0) {
       auto n = read(fd, w.aux_data(), w.remaining());
       if (n > 0) {
@@ -146,7 +148,8 @@ swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
         errata.error(
             R"(Connection closed unexpectedly while waiting for response header - {}.)",
             swoc::bwf::Errno{});
-        eos_p = true;
+        close(fd);
+        fd = -1;
         break;
       }
     }
@@ -154,39 +157,10 @@ swoc::Errata Run_Transaction(int fd, Txn const &txn, bool &eos_p) {
     if (eoh_offset) {
       auto result{rsp_hdr.parse_response(w.view().substr(0, eoh_offset))};
       if (result.is_ok()) {
-        size_t left_overs = w.size() - eoh_offset;
-        // soak up content.
-        std::string buff;
-        size_t content_length = std::numeric_limits<size_t>::max();
-        if (auto spot{rsp_hdr._fields.find(HttpHeader::FIELD_CONTENT_LENGTH)};
-            spot != rsp_hdr._fields.end()) {
-          content_length = swoc::svtou(spot->second);
-          if (content_length < left_overs) {
-            errata.error(
-                R"(Response overrun - received {} bytes of content, expected {}.)",
-                left_overs, content_length);
-            return errata;
-          }
-          content_length -= left_overs;
-        }
-        buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
-
-        size_t body_size = 0;
-        while (body_size < content_length) {
-          size_t n =
-              read(fd, buff.data(),
-                   std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE));
-          if (n <= 0) {
-            if (content_length != std::numeric_limits<size_t>::max()) {
-              errata.error(
-                  R"(Response underrun - recieved {} bytes of content, expected {}, when file closed because {}.)",
-                  body_size, content_length, swoc::bwf::Errno{});
-            }
-            eos_p = true;
-            break;
-          }
-          body_size += n;
-        }
+        std::cout << "reading response body" << std::endl;
+        rsp_hdr.update_content_length();
+        rsp_hdr.update_transfer_encoding();
+        errata = rsp_hdr.drain_body(fd, w.view().substr(eoh_offset));
       } else {
         errata.error(R"(Invalid response.)");
         errata.note(result);
@@ -211,6 +185,7 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
           ssn._path, ssn._line_no);
     }
     if (0 > socket_fd) {
+      std::cout << "Connecting" << std::endl;
       socket_fd = socket(target.family(), SOCK_STREAM, 0);
       if (socket_fd >= 0) {
         if (0 != connect(socket_fd, &target.sa, target.size())) {
@@ -223,12 +198,7 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
         break;
       }
     }
-    bool eos_p = false;
-    errata = Run_Transaction(socket_fd, txn, eos_p);
-    if (eos_p) {
-      close(socket_fd);
-      socket_fd = -1;
-    }
+    errata = Run_Transaction(socket_fd, txn);
     if (!errata.is_ok()) {
       break;
     }
@@ -276,7 +246,6 @@ void Engine::command_run() {
 
   auto &&[target, target_result] = Resolve_FQDN(args[1]);
   if (!target_result.is_ok()) {
-    std::cerr << target_result;
     return;
   }
 
@@ -289,9 +258,21 @@ void Engine::command_run() {
                             },
                             10);
   if (!result.is_ok()) {
-    std::cerr << result;
     return;
   }
+
+  // After this, any string expected to be localized that isn't is an error,
+  // so lock down the local string storage to avoid locking and report an
+  // error instead if not found.
+  HttpHeader::_frozen = true;
+  size_t max_content_length = 0;
+  for (auto const &ssn : Session_List) {
+    for (auto const &txn : ssn._txn) {
+      max_content_length =
+          std::max<size_t>(max_content_length, txn._req._content_size);
+    }
+  }
+  HttpHeader::set_max_content_length(max_content_length);
 
   auto start = std::chrono::high_resolution_clock::now();
   unsigned n_ssn = 0;
@@ -309,12 +290,9 @@ void Engine::command_run() {
     n_txn += ssn._txn.size();
   }
   auto delta = std::chrono::high_resolution_clock::now() - start;
-  std::cout << swoc::LocalBufferWriter<256>{}
-                   .print("{} transactions in {} sessions in {}.", n_ssn, n_txn,
+  erratum.info("{} transactions in {} sessions in {}.", n_ssn, n_txn,
                           std::chrono::duration_cast<std::chrono::milliseconds>(
-                              delta))
-                   .view()
-            << std::endl;
+                              delta));
 };
 
 int main(int argc, const char *argv[]) {
@@ -337,6 +315,9 @@ int main(int argc, const char *argv[]) {
 
   if (!engine.erratum.is_ok()) {
     std::cerr << engine.erratum;
+  } else if (engine.erratum.count()) {
+    std::cout << engine.erratum;
   }
+
   return engine.status_code;
 }
