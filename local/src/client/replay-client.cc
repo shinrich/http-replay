@@ -1,4 +1,7 @@
-#include <dirent.h>
+#include "core/ArgParser.h"
+#include "core/HttpReplay.h"
+#include "swoc/bwf_ex.h"
+#include "swoc/bwf_ip.h"
 
 #include <chrono>
 #include <list>
@@ -6,10 +9,10 @@
 #include <thread>
 #include <unistd.h>
 
-#include "core/ArgParser.h"
-#include "core/HttpReplay.h"
-#include "swoc/bwf_ex.h"
-#include "swoc/bwf_ip.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 
 namespace swoc {
 inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
@@ -124,49 +127,28 @@ swoc::Errata ClientReplayFileHandler::ssn_close() {
   return {};
 }
 
-swoc::Errata Run_Transaction(int &fd, Txn const &txn) {
-  std::cout << "Transaction" << std::endl;
-  swoc::Errata errata{txn._req.transmit(fd)};
-  std::cout << "Request sent" << std::endl;
+swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
+  Info("Running transaction.");
+  swoc::Errata errata{txn._req.transmit(stream)};
   if (errata.is_ok()) {
-    size_t eoh_offset = 0;
     HttpHeader rsp_hdr;
-    swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
-    std::cout << "Reading response header" << std::endl;
-    while (w.remaining() > 0) {
-      auto n = read(fd, w.aux_data(), w.remaining());
-      if (n > 0) {
-        size_t start =
-            std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
-        w.commit(n);
-        size_t offset = w.view().substr(start).find(HTTP_EOH);
-        if (TextView::npos != offset) {
-          eoh_offset = start + offset + HTTP_EOH.size();
-          break;
-        }
-      } else if (EINTR != errno) {
-        errata.error(
-            R"(Connection closed unexpectedly while waiting for response header - {}.)",
-            swoc::bwf::Errno{});
-        close(fd);
-        fd = -1;
-        break;
-      }
-    }
-
-    if (eoh_offset) {
-      auto result{rsp_hdr.parse_response(w.view().substr(0, eoh_offset))};
+    swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
+    Info("Reading response header.");
+    auto read_result { rsp_hdr.read_header(stream, w) };
+    if (read_result.is_ok()) {
+      ssize_t body_offset { read_result } ;
+      auto result{rsp_hdr.parse_response(TextView(w.data(), body_offset))};
       if (result.is_ok()) {
-        std::cout << "reading response body" << std::endl;
+        Info("Reading response body.");
         rsp_hdr.update_content_length();
         rsp_hdr.update_transfer_encoding();
-        errata = rsp_hdr.drain_body(fd, w.view().substr(eoh_offset));
+        errata = rsp_hdr.drain_body(stream, w.view().substr(body_offset));
       } else {
         errata.error(R"(Invalid response.)");
         errata.note(result);
       }
-    } else if (errata.is_ok()) {
-      errata.error(R"(Response exceeded maximum size {}.)", MAX_RSP_HDR_SIZE);
+    } else {
+      errata.note(read_result);
     }
   }
   return errata;
@@ -175,31 +157,41 @@ swoc::Errata Run_Transaction(int &fd, Txn const &txn) {
 swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
   swoc::Errata errata;
   int socket_fd = -2;
+  Stream stream;
 
-  std::cout << "Session" << std::endl;
+  Info(R"(Starting session "{}":{}.)", ssn._path, ssn._line_no);
 
   for (auto const &txn : ssn._txn) {
-    if (-1 == socket_fd) {
+    if (stream.is_closed()) {
+      if (socket_fd >= 0) {
       errata.info(
           R"(Session ["{}":{}] closed before all transactions completed.)",
           ssn._path, ssn._line_no);
     }
-    if (0 > socket_fd) {
-      std::cout << "Connecting" << std::endl;
+      Info("Connecting.");
       socket_fd = socket(target.family(), SOCK_STREAM, 0);
-      if (socket_fd >= 0) {
-        if (0 != connect(socket_fd, &target.sa, target.size())) {
-          errata.error(R"(Failed to connect to {} - {}.)", target,
-                       swoc::bwf::Errno{});
-          break;
+      if (0 <= socket_fd) {
+        errata = stream.open(socket_fd);
+        if (errata.is_ok()) {
+          if (0 == connect(socket_fd, &target.sa, target.size())) {
+            static const int ONE = 1;
+            int flags = fcntl(socket_fd, F_GETFL, 0);
+            fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+            setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+          } else {
+            errata.error(R"(Failed to connect to {} - {}.)", target,
+                         swoc::bwf::Errno{});
+          }
         }
       } else {
         errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
         break;
       }
     }
-    errata = Run_Transaction(socket_fd, txn);
-    if (!errata.is_ok()) {
+
+    if (errata.is_ok()) {
+      errata = Run_Transaction(stream, txn);
+    } else {
       break;
     }
   }
@@ -249,7 +241,7 @@ void Engine::command_run() {
     return;
   }
 
-  std::cout << "Loading " << args[0] << std::endl;
+  Info(R"(Loading directory "{}".)", args[0]);
   auto result =
       Load_Replay_Directory(swoc::file::path{args[0]},
                             [](swoc::file::path const &file) -> swoc::Errata {
@@ -283,22 +275,21 @@ void Engine::command_run() {
       std::cerr << result;
       break;
     }
-    if (result.count()) {
+    if (result.count() && Verbose) {
       std::cout << result;
     }
     ++n_ssn;
     n_txn += ssn._txn.size();
   }
   auto delta = std::chrono::high_resolution_clock::now() - start;
-  erratum.info("{} transactions in {} sessions in {}.", n_ssn, n_txn,
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              delta));
+  erratum.info("{} transactions in {} sessions in {}.", n_txn, n_ssn,
+               std::chrono::duration_cast<std::chrono::milliseconds>(delta));
 };
 
 int main(int argc, const char *argv[]) {
   Engine engine;
 
-  engine.parser.add_option("--debug", "", "Enable debugging output")
+  engine.parser.add_option("--verbose", "", "Enable verbose output")
       .add_option("--version", "-V", "Print version string")
       .add_option("--help", "-h", "Print usage information");
 
@@ -310,6 +301,10 @@ int main(int argc, const char *argv[]) {
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
+
+  if (auto args{engine.arguments.get("verbose")}; args) {
+    Verbose = true;
+  }
 
   engine.arguments.invoke();
 

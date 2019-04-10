@@ -10,7 +10,9 @@
 #include <bits/signum.h>
 #include <dirent.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 
 #include "core/ArgParser.h"
@@ -117,55 +119,36 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
   return {};
 }
 
-void TF_Serve(int socket_fd) {
+void TF_Serve(Stream &stream) {
   swoc::Errata errata;
   bool done_p = false;
-
-  while (socket_fd >= 0 && errata.is_ok()) {
-    size_t eoh_offset = 0;
+  while (!stream.is_closed() && errata.is_ok()) {
     HttpHeader req_hdr;
-    swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+    swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
+    auto read_result{req_hdr.read_header(stream, w)};
 
-    while (w.remaining() > 0) {
-      auto n = read(socket_fd, w.aux_data(), w.remaining());
-      std::cout << "Read " << n << " bytes" << std::endl;
-      if (n > 0) {
-        size_t start =
-            std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
-        w.commit(n);
-        size_t offset = w.view().substr(start).find(HTTP_EOH);
-        if (TextView::npos != offset) {
-          eoh_offset = start + offset + HTTP_EOH.size();
-          break; // full header has arrived.
-        }
-      } else if (EINTR != errno) {
-        if (w.size() > 0) {
-          errata.error(
-              R"(Connection closed unexpectedly after {} bytes while waiting for request header - {}.)",
-              w.size(), swoc::bwf::Errno{});
-          w.clear();
-        }
-        break;
+    if (read_result.is_ok()) {
+      ssize_t body_offset = read_result;
+      if (0 == body_offset) {
+        break; // client closed between transactions, that's not an error.
       }
-    }
-
-    if (eoh_offset) {
-      std::cout << "Read request" << std::endl;
-      auto result{req_hdr.parse_request(w.view())};
+      auto result{
+          req_hdr.parse_request(swoc::TextView(w.data(), body_offset))};
       if (result.is_ok()) {
-        std::cout << "Handling request" << std::endl;
+        Info("Handling request");
         auto key{req_hdr.make_key()};
         auto spot{Transactions.find(key)};
         if (spot != Transactions.end()) {
           [[maybe_unused]] auto const &[key, txn] = *spot;
           req_hdr.update_content_length();
           req_hdr.update_transfer_encoding();
-          if (req_hdr._content_length_p) {
-            std::cout << "Draining request" << std::endl;
-            errata = req_hdr.drain_body(socket_fd, w.view().substr(eoh_offset));
+          if (req_hdr._content_length_p || req_hdr._chunked_p) {
+            Info("Draining request body.");
+            errata =
+                req_hdr.drain_body(stream, w.view().substr(body_offset));
           }
-          std::cout << "Responding " << txn._rsp._status << std::endl;
-          errata = txn._rsp.transmit(socket_fd);
+          Info("Responding to request - status {}.", txn._rsp._status);
+          errata = txn._rsp.transmit(stream);
         } else {
           errata.error(R"(Proxy request with key "{}" not found.)", key);
         }
@@ -173,30 +156,34 @@ void TF_Serve(int socket_fd) {
         errata.error(R"(Proxy request was malformed.)");
         errata.note(result);
       }
-    } else if (w.size()) {
-      errata.error(R"(Response exceeded maximum size {}.)", MAX_REQ_HDR_SIZE);
     } else {
-      break; // clean close from client, after a complete transaction.
+      errata.note(read_result);
+      break;
     }
   }
 
   if (!errata.is_ok()) {
     std::cerr << errata;
   }
-  if (socket_fd >= 0) {
-    close(socket_fd);
-  }
 }
 
 void TF_Accept(int socket_fd) {
-  swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+  Stream reader;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
     socklen_t remote_addr_size;
-    int fd = accept(socket_fd, &remote_addr.sa, &remote_addr_size);
+    int fd =
+        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, SOCK_NONBLOCK);
     if (fd >= 0) {
-      TF_Serve(fd);
+      errata = reader.open(fd);
+      if (errata.is_ok()) {
+        static const int ONE = 1;
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+        TF_Serve(reader);
+      } else {
+        std::cerr << errata;
+      }
     }
   }
 }
@@ -264,9 +251,7 @@ void Engine::command_run() {
     if (bind_result == 0) {
       int listen_result = listen(socket_fd, 1);
       if (listen_result == 0) {
-        w.print(R"(Listening at {})", server_addr);
-        std::cout << w.view() << std::endl;
-
+        Info(R"(Listening at {})", server_addr);
         std::thread runner{TF_Accept, socket_fd};
         runner.join();
       } else {
@@ -280,12 +265,15 @@ void Engine::command_run() {
   } else {
     errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
   }
+  if (socket_fd >= 0) {
+    close(socket_fd);
+  }
 }
 
 int main(int argc, const char *argv[]) {
   Engine engine;
 
-  engine.parser.add_option("--debug", "", "Enable debugging output")
+  engine.parser.add_option("--verbose", "", "Enable verbose output")
       .add_option("--version", "-V", "Print version string")
       .add_option("--help", "-h", "Print usage information");
 
@@ -297,6 +285,9 @@ int main(int argc, const char *argv[]) {
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
+  if (auto args{engine.arguments.get("verbose")}; args) {
+    Verbose = true;
+  }
 
   engine.arguments.invoke();
 

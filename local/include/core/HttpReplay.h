@@ -25,6 +25,9 @@
 #include <string>
 #include <unordered_set>
 
+#include <sys/epoll.h>
+#include <unistd.h>
+
 #include "yaml-cpp/yaml.h"
 
 #include "swoc/BufferWriter.h"
@@ -55,13 +58,41 @@ static const std::string YAML_HTTP_URL_KEY{"url"};
 static const std::string YAML_CONTENT_KEY{"content"};
 static const std::string YAML_CONTENT_LENGTH_KEY{"size"};
 
-static constexpr size_t MAX_REQ_HDR_SIZE = 65536;
-static constexpr size_t MAX_RSP_HDR_SIZE = 65536;
+static constexpr size_t MAX_HDR_SIZE = 65536;
 static constexpr size_t MAX_DRAIN_BUFFER_SIZE = 1 << 20;
 /// HTTP end of line.
 static constexpr swoc::TextView HTTP_EOL{"\r\n"};
 /// HTTP end of header.
 static constexpr swoc::TextView HTTP_EOH{"\r\n\r\n"};
+
+extern bool Verbose;
+
+/** A stream reader.
+ * This is essential a wrapper around a socket to support use of @c epoll on the
+ * socket. The goal is to enable a read operation that waits for data but
+ * returns as soon as any data is available.
+ */
+class Stream {
+public:
+  Stream();
+  ~Stream();
+
+  int fd() const;
+  ssize_t read(swoc::MemSpan<char> span);
+  ssize_t write(swoc::TextView data);
+
+  swoc::Errata open(int fd);
+  bool is_closed() const;
+  void close();
+
+protected:
+  int _fd = -1;      ///< Socket.
+  int _poll_fd = -1; ///< polling file descriptor.
+  epoll_event _epv;  ///< Event object.
+};
+
+inline int Stream::fd() const { return _fd; }
+inline bool Stream::is_closed() const { return _fd < 0; }
 
 class ChunkCodex {
 public:
@@ -72,7 +103,8 @@ public:
   /// Because the data provided might not contain the entire chunk, a chunk can
   /// come back piecemeal in the callbacks. The @a offset and @a size specify
   /// where in the actual chunk the particular piece in @a chunk is placed.
-  using ChunkCallback = std::function<bool(swoc::TextView chunk, size_t offset, size_t size)>;
+  using ChunkCallback =
+      std::function<bool(swoc::TextView chunk, size_t offset, size_t size)>;
   enum Result { CONTINUE, DONE, ERROR };
 
   /** Parse @a data as chunked encoded.
@@ -96,8 +128,8 @@ public:
    * encoding).
    *   - An error code, which will be 0 if all data was successfully written.
    */
-  std::tuple<ssize_t, std::error_code> transmit(int fd, swoc::TextView data,
-                                               size_t chunk_size = 4096);
+  std::tuple<ssize_t, std::error_code> transmit(Stream &stream, swoc::TextView data,
+                                                size_t chunk_size = 4096);
 
 protected:
   size_t _size = 0; ///< Size of the current chunking being decoded.
@@ -123,34 +155,69 @@ class HttpHeader {
   using TextView = swoc::TextView;
 
 public:
-  enum ParseResult { PARSE_OK, PARSE_ERROR, PARSE_INCOMPLETE };
+  /// Parsing results.
+  enum ParseResult {
+    PARSE_OK,        ///< Parse finished sucessfully.
+    PARSE_ERROR,     ///< Invalid data.
+    PARSE_INCOMPLETE ///< Parsing not complete.
+  };
 
+  /// Important header fields.
+  /// @{
   static TextView FIELD_CONTENT_LENGTH;
   static TextView FIELD_TRANSFER_ENCODING;
+  /// @}
 
+  /// Mark which status codes have no content by default.
   static std::bitset<600> STATUS_NO_CONTENT;
+
+  /** Read and parse a header.
+   *
+   * @param reader [in,out] Data source.
+   * @param w [in,out] Read buffer.
+   * @return The size of the parsed header, or errors.
+   *
+   * Because the reading can overrun the header, the overrun must be made
+   * available to the caller.
+   * @a w is updated to mark all data read (via @c w.size() ). The return value
+   * is the size of the header - data past that is the overrun.
+   *
+   * @note The reader may end up with a closed socket if the socket closes while
+   * reading. This must be checked by the caller by calling @c
+   * reader.is_closed().
+   */
+  swoc::Rv<ssize_t> read_header(Stream &reader, swoc::FixedBufferWriter &w);
 
   /** Write the header to @a fd.
    *
    * @param fd Ouput stream.
    */
-  swoc::Errata transmit(int &fd) const;
+  swoc::Errata transmit(Stream& stream) const;
 
-  swoc::Errata transmit_body(int &fd) const;
+  /** Write the body to @a fd.
+   *
+   * @param fd Outpuf file.
+   * @return Errors, if any.
+   *
+   * This synthesizes the content based on values in the header.
+   */
+  swoc::Errata transmit_body(Stream& stream) const;
 
   /** Drain the content.
    *
-   * @param fd [in,out]File to read. This is changed to -1 if closed while draining.
+   * @param fd [in,out]File to read. This is changed to -1 if closed while
+   * draining.
    * @param initial Initial part of the body.
    * @return Errors, if any.
    *
-   * If the return is an error, @a fd should be closed. It can be the case @a fd is closed
-   * without an error, @a fd must be checked after the call to detect this.
+   * If the return is an error, @a fd should be closed. It can be the case @a fd
+   * is closed without an error, @a fd must be checked after the call to detect
+   * this.
    *
-   * @a initial is needed for cases where part of the content is captured while trying to read
-   * the header.
+   * @a initial is needed for cases where part of the content is captured while
+   * trying to read the header.
    */
-  swoc::Errata drain_body(int &fd, TextView initial) const;
+  swoc::Errata drain_body(Stream& stream, TextView initial) const;
 
   swoc::Errata load(YAML::Node const &node);
   swoc::Errata parse_fields(YAML::Node const &field_list_node);
@@ -286,3 +353,18 @@ public:
   using type = swoc::Errata;
 };
 } // namespace std
+
+template <typename... Args> void Info(swoc::TextView fmt, Args &&... args) {
+  if (Verbose) {
+    swoc::LocalBufferWriter<1024> w;
+    w.print_v(fmt, std::forward_as_tuple(args...));
+    if (w.error()) {
+      std::string s;
+      swoc::bwprint_v(s, fmt, std::forward_as_tuple(args...));
+      std::cout << s << std::endl;
+      std::cout << s << std::endl;
+    } else {
+      std::cout << w << std::endl;
+    }
+  }
+}

@@ -31,6 +31,8 @@
 #include "swoc/bwf_ex.h"
 #include "swoc/bwf_std.h"
 
+bool Verbose = false;
+
 bool HttpHeader::_frozen = false;
 swoc::MemArena HttpHeader::_arena{8000};
 HttpHeader::NameSet HttpHeader::_names;
@@ -46,6 +48,69 @@ namespace {
   HttpHeader::global_init();
   return true;
 }();
+}
+
+Stream::Stream() {
+  _poll_fd = epoll_create(1);
+}
+
+Stream::~Stream() {
+  this->close();
+  if (_poll_fd >= 0) {
+    ::close(_poll_fd);
+    _poll_fd = -1;
+  }
+}
+
+ssize_t Stream::read(swoc::MemSpan<char> span) {
+  static constexpr auto EVENTS = EPOLLIN | EPOLLRDHUP;
+  epoll_event ev;
+  ssize_t n = -1;
+
+  if (_epv.events != EVENTS) {
+    _epv.events = EVENTS;
+    epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
+  }
+  // AFAICT if the socket has been closed, both the IN and RDHUP events are set in the return.
+  auto result = epoll_wait(_poll_fd, &ev, 1, -1);
+  if (result > 0 && ev.events & EPOLLIN) {
+    n = ::read(_fd, span.data(), span.size());
+  }
+  if (n <= 0 || !(ev.events & EPOLLIN)) {
+    this->close();
+  }
+  return n;
+}
+
+ssize_t Stream::write(swoc::TextView view) {
+  static constexpr auto EVENTS = EPOLLOUT | EPOLLRDHUP;
+  epoll_event ev;
+  if (_epv.events != EVENTS) {
+    _epv.events = EPOLLOUT | EPOLLRDHUP;
+    epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
+  }
+  epoll_wait(_poll_fd, &ev, 1, -1);
+  return ::write(_fd, view.data(), view.size());
+}
+
+swoc::Errata Stream::open(int fd) {
+  swoc::Errata errata;
+  this->close();
+  _fd = fd;
+  _epv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+  _epv.data.ptr = static_cast<void *>(this);
+  if (0 > epoll_ctl(_poll_fd, EPOLL_CTL_ADD, _fd, &_epv)) {
+    errata.error(R"(Failed to add file descriptor {} to epoll - {}.)", fd, swoc::bwf::Errno{});
+  }
+  return errata;
+}
+
+void Stream::close() {
+  if (!this->is_closed()) {
+    epoll_ctl(_poll_fd, EPOLL_CTL_DEL, _fd, &_epv);
+    ::close(_fd);
+    _fd = -1;
+  }
 }
 
 ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
@@ -66,9 +131,10 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
         break;
       }
     case State::CR:
-      while (data && *data != '\r') {
-        ++data;
+      if (*data == '\r') {
+        _state = State::LF;
       }
+      ++data;
       break;
     case State::LF:
       if (*data == '\n') {
@@ -98,7 +164,7 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
 }
 
 std::tuple<ssize_t, std::error_code>
-ChunkCodex::transmit(int fd, swoc::TextView data, size_t chunk_size) {
+ChunkCodex::transmit(Stream& stream, swoc::TextView data, size_t chunk_size) {
   static const std::error_code NO_ERROR;
   static constexpr swoc::TextView ZERO_CHUNK{"0\r\n"};
 
@@ -111,9 +177,9 @@ ChunkCodex::transmit(int fd, swoc::TextView data, size_t chunk_size) {
       w.clear().print("{:x}{}", data.size(), HTTP_EOL);
       chunk_size = data.size();
     }
-    n = write(fd, w.data(), w.size());
+    n = stream.write(w.view());
     if (n > 0) {
-      n = write(fd, data.data(), chunk_size);
+      n = stream.write({data.data(), chunk_size});
       if (n > 0) {
         total += n;
         if (n == chunk_size) {
@@ -126,7 +192,7 @@ ChunkCodex::transmit(int fd, swoc::TextView data, size_t chunk_size) {
       return {total, std::error_code(errno, std::system_category())};
     }
   }
-  n = write(fd, ZERO_CHUNK.data(), ZERO_CHUNK.size());
+  n = stream.write(ZERO_CHUNK);
   if (n != ZERO_CHUNK.size()) {
     return {total, std::error_code(errno, std::system_category())};
   }
@@ -176,60 +242,64 @@ swoc::Errata HttpHeader::update_transfer_encoding() {
   return {};
 }
 
-swoc::Errata HttpHeader::transmit_body(int &fd) const {
+swoc::Errata HttpHeader::transmit_body(Stream& stream) const {
   swoc::Errata errata;
   ssize_t n;
   std::error_code ec;
 
-  std::cout << swoc::LocalBufferWriter<256>{}.print("Transmit body - {} bytes {}{}\n", _content_size, swoc::bwf::If(_content_length_p, "[CL]"), swoc::bwf::If(_chunked_p, "[chunked]")).view();
+  Info("Transmit {} byte body {}{}.", _content_size,
+       swoc::bwf::If(_content_length_p, "[CL]"),
+       swoc::bwf::If(_chunked_p, "[chunked]"));
   if (_content_size || (_status && !STATUS_NO_CONTENT[_status])) {
     if (_chunked_p) {
       ChunkCodex codex;
-      std::tie(n, ec) = codex.transmit(fd, { _content.data(), _content_size });
+      std::tie(n, ec) = codex.transmit(stream, {_content.data(), _content_size});
     } else {
-      n = write(fd, _content.data(), _content_size);
+      n = stream.write({_content.data(), _content_size});
       ec = std::error_code(errno, std::system_category());
-      if (! _content_length_p) { // no content-length, must close to signal end of body.
-        std::cout << swoc::LocalBufferWriter<64>{}.print("No CL, status {} - closing.\n", _status);
-        close(fd);
-        fd = -1;
+      if (!_content_length_p) { // no content-length, must close to signal end
+                                // of body.
+        Info("No CL, status {} - closing.", _status);
+        stream.close();
       }
     }
     if (n != _content_size) {
-      errata.error(R"(Body write{} failed - {} of {} bytes written - {}.)", swoc::bwf::If(_chunked_p, " [chunked]"), n, _content_size, ec);
+      errata.error(R"(Body write{} failed - {} of {} bytes written - {}.)",
+                   swoc::bwf::If(_chunked_p, " [chunked]"), n, _content_size,
+                   ec);
     }
   }
 
   return errata;
 }
 
-swoc::Errata HttpHeader::transmit(int &fd) const {
+swoc::Errata HttpHeader::transmit(Stream& stream) const {
   swoc::Errata errata;
 
   if (_status) {
-    swoc::LocalBufferWriter<MAX_RSP_HDR_SIZE> w;
+    swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
     w.print("HTTP/{} {} {}{}", _http_version, _status, _reason, HTTP_EOL);
     for (auto const &[name, value] : _fields) {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
     w.write(HTTP_EOL);
-    ssize_t n = write(fd, w.data(), w.size());
+    ssize_t n = stream.write(w.view());
     if (n == w.size()) {
-      errata = this->transmit_body(fd);
+      errata = this->transmit_body(stream);
     } else {
       errata.error(R"(Header write failed - {} of {} bytes written - {}.)", n,
                    w.size(), swoc::bwf::Errno{});
     }
   } else if (_method) {
-    swoc::LocalBufferWriter<MAX_REQ_HDR_SIZE> w;
+    swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
     w.print("{} {} HTTP/{}{}", _method, _url, _http_version, HTTP_EOL);
     for (auto const &[name, value] : _fields) {
       w.write(name).write(": ").write(value).write(HTTP_EOL);
     }
     w.write(HTTP_EOL);
-    ssize_t n = write(fd, w.data(), w.size());
+    ssize_t n = stream.write({w.data(), w.size()});
     if (n == w.size()) {
-      errata = this->transmit_body(fd);
+      errata = this->transmit_body(stream);
     } else {
       errata.error(R"(Header write failed - {} of {} bytes written - {}.)", n,
                    w.size(), swoc::bwf::Errno{});
@@ -240,44 +310,45 @@ swoc::Errata HttpHeader::transmit(int &fd) const {
   return errata;
 }
 
-swoc::Errata HttpHeader::drain_body(int &fd, swoc::TextView initial) const {
+swoc::Errata HttpHeader::drain_body(Stream &stream, swoc::TextView initial) const {
   static constexpr size_t UNBOUNDED = std::numeric_limits<size_t>::max();
   swoc::Errata errata;
   size_t body_size = 0; // bytes drained for the content body.
-  std::string buff;
+  static std::string buff;
   size_t content_length = _content_length_p ? _content_size : UNBOUNDED;
   if (content_length < initial.size()) {
     errata.error(
-        R"(Response overrun - received {} bytes of content, expected {}.)",  initial.size(), content_length);
+        R"(Response overrun - received {} bytes of content, expected {}.)",
+        initial.size(), content_length);
     return errata;
   }
 
   // If there's a status, and it indicates no body, we're done.
-  if (_status && STATUS_NO_CONTENT[_status] && ! _content_length_p) {
+  if (_status && STATUS_NO_CONTENT[_status] && !_content_length_p) {
     return errata;
   }
 
   buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
 
   if (_chunked_p) {
-    ChunkCodex::ChunkCallback cb { [&](TextView block, size_t offset, size_t size) -> bool {
-      body_size += block.size();
-      return true;
-    }};
+    ChunkCodex::ChunkCallback cb{
+        [&](TextView block, size_t offset, size_t size) -> bool {
+          body_size += block.size();
+          return true;
+        }};
     ChunkCodex codex;
 
     auto result = codex.parse(initial, cb);
     while (result == ChunkCodex::CONTINUE && body_size < content_length) {
-      ssize_t n =
-          read(fd, buff.data(),
-               std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE));
-      if (n > 0) {
+      auto n { stream.read({buff.data(),
+               std::min<size_t>(content_length - body_size, MAX_DRAIN_BUFFER_SIZE)})};
+      if (! stream.is_closed()) {
         result = codex.parse(TextView(buff.data(), n), cb);
       } else {
         if (content_length == UNBOUNDED) {
-          std::cout << "Connection close" << std::endl;
-          close(fd);
-          fd = -1;
+          // Is this an error? It's chunked, so an actual close seems unexpected - should have
+          // parsed the empty chunk.
+          Info("Connection closed on unbounded body.");
         } else {
           errata.error(
               R"(Response underrun - recieved {} bytes of content, expected {}, when file closed because {}.)",
@@ -286,31 +357,30 @@ swoc::Errata HttpHeader::drain_body(int &fd, swoc::TextView initial) const {
         break;
       }
     }
-    if (result != ChunkCodex::DONE || (content_length != UNBOUNDED && body_size != content_length)) {
-      errata.error(R"(Invalid response - expected {} bytes, drained {} byts.)", content_length, body_size);
+    if (result != ChunkCodex::DONE ||
+        (content_length != UNBOUNDED && body_size != content_length)) {
+      errata.error(R"(Invalid response - expected {} bytes, drained {} byts.)",
+                   content_length, body_size);
     }
-    std::cout << "Drained " << body_size << " chunked bytes" << std::endl;
+    Info("Drained {} chunked bytes.", body_size);
   } else {
     body_size = initial.size();
     while (body_size < content_length) {
-      ssize_t n =
-          read(fd, buff.data(),
-               std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE));
-      if (n <= 0) {
+      ssize_t n = stream.read({buff.data(),
+               std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE)});
+      if (stream.is_closed()) {
         if (content_length == UNBOUNDED) {
-          std::cout << "Connection close" << std::endl;
-          close(fd);
-          fd = -1;
+          Info("Connection close on unbounded body");
         } else {
           errata.error(
-              R"(Response underrun - recieved {} bytes of content, expected {}, when file closed because {}.)",
+              R"(Response underrun - recieved {} bytes  of content, expected {}, when file closed because {}.)",
               body_size, content_length, swoc::bwf::Errno{});
         }
         break;
       }
       body_size += n;
     }
-    std::cout << "Drained " << body_size << " bytes" << std::endl;
+    Info("Drained {} bytes.", body_size);
   }
   return errata;
 }
@@ -335,6 +405,40 @@ swoc::Errata HttpHeader::parse_fields(YAML::Node const &field_list_node) {
     }
   }
   return errata;
+}
+
+swoc::Rv<ssize_t> HttpHeader::read_header(Stream &reader,
+                                          swoc::FixedBufferWriter &w) {
+  swoc::Rv<ssize_t> zret{-1};
+
+  Info("Reading header.");
+  while (w.remaining() > 0) {
+    auto n = reader.read(w.aux_span());
+    if (! reader.is_closed()) {
+      // Where to start searching for the EOH string.
+      size_t start =
+          std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
+      w.commit(n);
+      size_t offset = w.view().substr(start).find(HTTP_EOH);
+      if (TextView::npos != offset) {
+        zret = start + offset + HTTP_EOH.size();
+        break;
+      }
+    } else {
+      if (w.size()) {
+        zret.errata().error(
+            R"(Connection closed unexpectedly after {} bytes while waiting for header - {}.)",
+            w.size(), swoc::bwf::Errno{});
+      } else {
+        zret = 0; // clean close between transactions.
+      }
+      break;
+    }
+  }
+  if (zret.is_ok() && zret == -1) {
+    zret.errata().error(R"(Header exceeded maximum size {}.)", w.capacity());
+  }
+  return std::move(zret);
 }
 
 swoc::Errata HttpHeader::load(YAML::Node const &node) {
@@ -516,9 +620,10 @@ HttpHeader::parse_response(swoc::TextView data) {
           continue;
         }
         auto value{field};
-        auto name{this->localize(value.take_prefix_at(':'))};
+        //        auto name{this->localize(value.take_prefix_at(':'))};
+        auto name{value.take_prefix_at(':')};
         value.trim_if(&isspace);
-        if (name && value) {
+        if (name) {
           _fields[name] = value;
         } else {
           zret = PARSE_ERROR;
@@ -674,7 +779,7 @@ Load_Replay_Directory(swoc::file::path const &path,
         }
       };
 
-      std::cout << "Loading " << n_sessions << " replay files." << std::endl;
+      Info("Loading {} replay files.", n_sessions);
       std::vector<std::thread> threads;
       threads.reserve(n_threads);
       for (int tidx = 0; tidx < n_threads; ++tidx) {
