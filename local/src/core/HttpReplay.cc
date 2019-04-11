@@ -53,59 +53,30 @@ namespace {
 }();
 }
 
-Stream::Stream() { _poll_fd = epoll_create(1); }
+Stream::Stream() {
+}
 
 Stream::~Stream() {
   this->close();
-  if (_poll_fd >= 0) {
-    ::close(_poll_fd);
-    _poll_fd = -1;
-  }
 }
 
 ssize_t Stream::read(swoc::MemSpan<char> span) {
-  static constexpr auto EVENTS = EPOLLIN | EPOLLRDHUP;
-  epoll_event ev;
-  ssize_t n = -1;
-
-  if (_epv.events != EVENTS) {
-    _epv.events = EVENTS;
-    epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
-  }
-  // AFAICT if the socket has been closed, both the IN and RDHUP events are set
-  // in the return.
-  auto result = epoll_wait(_poll_fd, &ev, 1, -1);
-  if (result > 0 && ev.events & EPOLLIN) {
-    n = ::read(_fd, span.data(), span.size());
-  }
-  if (n <= 0 || !(ev.events & EPOLLIN)) {
+  ssize_t n = ::read(_fd, span.data(), span.size());
+  if (n <= 0) {
     this->close();
   }
   return n;
 }
 
 ssize_t TLSStream::read(swoc::MemSpan<char> span) {
-  static constexpr auto EVENTS = EPOLLIN | EPOLLRDHUP;
-  epoll_event ev;
   ssize_t n = -1;
   int ssl_error = 0;
 
   do {
-   if (_epv.events != EVENTS) {
-      _epv.events = EVENTS;
-      epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
-    }
-    // AFAICT if the socket has been closed, both the IN and RDHUP events are set in the return.
-    auto result = epoll_wait(_poll_fd, &ev, 1, -1);
-    if (result > 0 && ev.events & EPOLLIN) {
-      n = SSL_read(this->_ssl, span.data(), span.size());
-      if (n <= 0) {
-        ssl_error = SSL_get_error(_ssl, n);
-      } else {
-        ssl_error = 0;
-      }
-    }
-    if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ) || !(ev.events & EPOLLIN)) {
+    n = SSL_read(this->_ssl, span.data(), span.size());
+    ssl_error = (n <= 0) ? SSL_get_error(_ssl, n) : 0;
+
+    if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ)) {
       fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n, SSL_get_error(_ssl, n), ERR_lib_error_string(ERR_peek_last_error()));
       this->close();
     } else if (n == 0) {
@@ -117,40 +88,15 @@ ssize_t TLSStream::read(swoc::MemSpan<char> span) {
 
 
 ssize_t Stream::write(swoc::TextView view) {
-  static constexpr auto EVENTS = EPOLLOUT | EPOLLRDHUP;
-  epoll_event ev;
-  if (_epv.events != EVENTS) {
-    _epv.events = EPOLLOUT | EPOLLRDHUP;
-    epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
-  }
-
-  ssize_t count = 0;
-  while (view) {
-    epoll_wait(_poll_fd, &ev, 1, -1);
-    ssize_t n = ::write(_fd, view.data(), view.size());
-    if (n > 0) {
-      count += n;
-      view.remove_prefix(n);
-    } else {
-      break;
-    }
-  }
-  return count;
+  return ::write(_fd, view.data(), view.size());
 }
 
 ssize_t TLSStream::write(swoc::TextView view) {
-  static constexpr auto EVENTS = EPOLLOUT | EPOLLRDHUP;
   int total_size = view.size();
   int num_written = 0;
   while (num_written < total_size) { 
-    epoll_event ev;
-    if (_epv.events != EVENTS) {
-      _epv.events = EPOLLOUT | EPOLLRDHUP;
-      epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
-    }
-    epoll_wait(_poll_fd, &ev, 1, -1);
     int n = SSL_write(this->_ssl, view.data() + num_written, view.size() - num_written);
-    if (n <= 0 || !(ev.events & EPOLLOUT)) {
+    if (n <= 0) {
       fprintf(stderr, "write failed: %s\n", ERR_lib_error_string(ERR_peek_last_error()));
       return n;
     } else {
@@ -164,12 +110,6 @@ swoc::Errata Stream::open(int fd) {
   swoc::Errata errata;
   this->close();
   _fd = fd;
-  _epv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
-  _epv.data.ptr = static_cast<void *>(this);
-  if (0 > epoll_ctl(_poll_fd, EPOLL_CTL_ADD, _fd, &_epv)) {
-    errata.error(R"(Failed to add file descriptor {} to epoll - {}.)", fd,
-                 swoc::bwf::Errno{});
-  }
   return errata;
 }
 
@@ -180,8 +120,7 @@ swoc::Errata TLSStream::accept() {
   if (_ssl == nullptr) {
     errata.error(R"(Failed to create SSL server object fd={} server_ctx={} err={}.)", _fd, server_ctx, ERR_lib_error_string(ERR_peek_last_error()));
   } else {
-    BIO *bio = BIO_new_fd(_fd, BIO_NOCLOSE);
-    SSL_set_bio(_ssl, bio, bio);
+    SSL_set_fd(_ssl, _fd);
     int retval = SSL_accept(_ssl);  
     if (retval <= 0) {
       errata.error(R"(Failed SSL_accept {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
@@ -209,7 +148,6 @@ swoc::Errata TLSStream::connect() {
 
 void Stream::close() {
   if (!this->is_closed()) {
-    epoll_ctl(_poll_fd, EPOLL_CTL_DEL, _fd, &_epv);
     ::close(_fd);
     _fd = -1;
   }

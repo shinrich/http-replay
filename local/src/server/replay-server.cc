@@ -227,8 +227,6 @@ void TF_TLS_Accept(int socket_fd) {
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
 
         errata = reader.accept(); // Do the handshake
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | SOCK_NONBLOCK);
         if (errata.is_ok()) {
           TF_Serve(reader);
         } else {
@@ -248,7 +246,7 @@ void TF_Accept(int socket_fd) {
     swoc::IPEndpoint remote_addr;
     socklen_t remote_addr_size;
     int fd =
-        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, SOCK_NONBLOCK);
+        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
     if (fd >= 0) {
       stream.reset(new Stream);
       errata = stream->open(fd);
@@ -348,20 +346,27 @@ void Engine::command_run() {
   // Set up listen port.
   int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
   if (socket_fd >= 0) {
-    int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
-    if (bind_result == 0) {
-      int listen_result = listen(socket_fd, 1);
-      if (listen_result == 0) {
-        Info(R"(Listening at {})", server_addr);
-        std::thread runner{TF_TLS_Accept, socket_fd};
-        runner.join();
+    // Be agressive in reusing the port
+    int ONE = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+      errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
+                       swoc::bwf::Errno{});
+    } else {
+      int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
+      if (bind_result == 0) {
+        int listen_result = listen(socket_fd, 1);
+        if (listen_result == 0) {
+          Info(R"(Listening at {})", server_addr);
+          std::thread runner{TF_TLS_Accept, socket_fd};
+          runner.join();
+        } else {
+          errata.error(R"(Could not listen to {} - {}.)", server_addr,
+                       swoc::bwf::Errno{});
+        }
       } else {
-        errata.error(R"(Could not listen to {} - {}.)", server_addr,
+        errata.error(R"(Could not bind to {} - {}.)", server_addr,
                      swoc::bwf::Errno{});
       }
-    } else {
-      errata.error(R"(Could not bind to {} - {}.)", server_addr,
-                   swoc::bwf::Errno{});
     }
   } else {
     errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});

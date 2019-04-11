@@ -25,7 +25,6 @@
 #include <string>
 #include <unordered_set>
 
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <openssl/ssl.h>
 
@@ -89,9 +88,7 @@ public:
   virtual void close();
 
 protected:
-  int _fd = -1;                 ///< Socket.
-  int _poll_fd = -1;            ///< polling file descriptor.
-  epoll_event _epv{0, nullptr}; ///< Event object.
+  int _fd = -1;      ///< Socket.
 };
 
 inline int Stream::fd() const { return _fd; }

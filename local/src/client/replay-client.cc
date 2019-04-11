@@ -219,8 +219,6 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
             static const int ONE = 1;
             setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
             errata = stream.connect();
-            int flags = fcntl(socket_fd, F_GETFL, 0);
-            fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
             if (!errata.is_ok()) {
               break; 
             } 
