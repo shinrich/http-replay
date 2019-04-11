@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -105,7 +106,7 @@ swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
     if (start_node.IsScalar()) {
       auto t = swoc::svtou(start_node.Scalar());
       if (t != 0) {
-        _ssn->_start = t;
+        _ssn->_start = t/1000; // Convert to usec from nsec
       } else {
         errata.warn(
             R"(Session at "{}":{} has a "{}" value "{}" that is not a positive integer.)",
@@ -281,6 +282,12 @@ struct Engine {
   swoc::Errata erratum;
 };
 
+uint64_t GetUTimestamp() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return tv.tv_sec*1000000 + tv.tv_usec;
+}
+
 void Engine::command_run() {
   auto args{arguments.get("run")};
   dirent **elements = nullptr;
@@ -356,7 +363,11 @@ void Engine::command_run() {
   auto start = std::chrono::high_resolution_clock::now();
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
+  uint64_t lasttime = GetUTimestamp();
   for (auto const *ssn : Session_List) {
+    uint64_t curtime = GetUTimestamp();
+    uint64_t nexttime = rate_multiplier * (lasttime + ssn->_start);
+    lasttime = GetUTimestamp();
     result = Run_Session(*ssn, target, target_https);
     if (!result.is_ok()) {
       std::cerr << result;
