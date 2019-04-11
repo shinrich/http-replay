@@ -104,8 +104,8 @@ public:
   swoc::Errata accept();
   swoc::Errata connect();
   static void init();
-  static const char *certificate_file;
-  static const char *privatekey_file;
+  static std::string certificate_file;
+  static std::string privatekey_file;
 protected:
   SSL *_ssl = nullptr;
   static SSL_CTX *server_ctx;

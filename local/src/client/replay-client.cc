@@ -196,7 +196,7 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
   return errata;
 }
 
-swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
+swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::IPEndpoint const &target_https) {
   swoc::Errata errata;
   int socket_fd = -2;
   TLSStream stream;
@@ -258,7 +258,8 @@ struct Engine {
   static constexpr swoc::TextView COMMAND_RUN{"run"};
   static constexpr swoc::TextView COMMAND_RUN_ARGS{
       "Arguments:\n\t<dir>: Directory containing replay files.\n\t<upstream>: "
-      "Upstream destination for requests."};
+      "Upstream destination for http requests."
+      "Upstream destination for https requests."};
   void command_run();
 
   /// Status code to return to the operating system.
@@ -271,7 +272,7 @@ void Engine::command_run() {
   auto args{arguments.get("run")};
   dirent **elements = nullptr;
 
-  if (args.size() < 2) {
+  if (args.size() < 3) {
     erratum.error(R"(Not enough arguments for "{}" command.\n{})", COMMAND_RUN,
                   COMMAND_RUN_ARGS);
     status_code = 1;
@@ -284,6 +285,10 @@ void Engine::command_run() {
 
   auto &&[target, target_result] = Resolve_FQDN(args[1]);
   if (!target_result.is_ok()) {
+    return;
+  }
+  auto &&[target_https, target_result_https] = Resolve_FQDN(args[2]);
+  if (!target_result_https.is_ok()) {
     return;
   }
 
@@ -319,7 +324,7 @@ void Engine::command_run() {
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
   for (auto const &ssn : Session_List) {
-    result = Run_Session(ssn, target);
+    result = Run_Session(ssn, target, target_https);
     if (!result.is_ok()) {
       std::cerr << result;
       break;

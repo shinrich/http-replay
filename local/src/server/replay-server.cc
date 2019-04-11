@@ -8,6 +8,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <libgen.h>
 
 #include <bits/signum.h>
 #include <dirent.h>
@@ -287,10 +288,48 @@ void TF_Accept(int socket_fd) {
   }
 }
 
+swoc::Errata
+do_listen(swoc::IPEndpoint &server_addr, void (*accept_func)(int))
+{
+  swoc::Errata errata;
+  int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
+  if (socket_fd >= 0) {
+    // Be agressive in reusing the port
+    int ONE = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+      errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
+                       swoc::bwf::Errno{});
+    } else {
+      int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
+      if (bind_result == 0) {
+        int listen_result = listen(socket_fd, 1);
+        if (listen_result == 0) {
+          Info(R"(Listening at {})", server_addr);
+          std::thread runner{accept_func, socket_fd};
+          runner.join();
+        } else {
+          errata.error(R"(Could not isten to {} - {}.)", server_addr,
+                       swoc::bwf::Errno{});
+        }
+      } else {
+        errata.error(R"(Could not bind to {} - {}.)", server_addr,
+                     swoc::bwf::Errno{});
+      }
+    }
+  } else {
+    errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
+  }
+  if (socket_fd >= 0) {
+    close(socket_fd);
+  }
+  return errata;
+}
+
 void Engine::command_run() {
   auto args{arguments.get("run")};
-  swoc::IPEndpoint server_addr;
+  swoc::IPEndpoint server_addr, server_addr_https;
   auto server_addr_arg{arguments.get("listen")};
+  auto server_addr_https_arg{arguments.get("listen-https")};
   swoc::LocalBufferWriter<1024> w;
 
   if (args.size() < 1) {
@@ -308,6 +347,23 @@ void Engine::command_run() {
       errata.error(
           R"(--listen option must have a single value, the listen address and port.)");
     }
+  }
+
+  if (server_addr_https_arg) {
+    if (server_addr_https_arg.size() == 1) {
+      if (!server_addr_https.parse(server_addr_https_arg[0])) {
+        errata.error(R"("{}" is not a valid IP address.)", server_addr_https_arg);
+        return;
+      }
+    } else {
+      errata.error(
+          R"(--listen-https option must have a single value, the listen address and port.)");
+    }
+  }
+
+  if (!server_addr.is_valid() && !server_addr_https.is_valid()) {
+    errata.error(
+        R"(Must specify a http or https listen port via --listen or --listen-https)");
   }
 
   if (!errata.is_ok()) {
@@ -344,35 +400,14 @@ void Engine::command_run() {
   std::cout << "Ready" << std::endl;
 
   // Set up listen port.
-  int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
-  if (socket_fd >= 0) {
-    // Be agressive in reusing the port
-    int ONE = 1;
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
-      errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
-                       swoc::bwf::Errno{});
-    } else {
-      int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
-      if (bind_result == 0) {
-        int listen_result = listen(socket_fd, 1);
-        if (listen_result == 0) {
-          Info(R"(Listening at {})", server_addr);
-          std::thread runner{TF_TLS_Accept, socket_fd};
-          runner.join();
-        } else {
-          errata.error(R"(Could not listen to {} - {}.)", server_addr,
-                       swoc::bwf::Errno{});
-        }
-      } else {
-        errata.error(R"(Could not bind to {} - {}.)", server_addr,
-                     swoc::bwf::Errno{});
-      }
-    }
-  } else {
-    errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
+  if (server_addr.is_valid()) {
+    errata = do_listen(server_addr, TF_Accept);
   }
-  if (socket_fd >= 0) {
-    close(socket_fd);
+  if (!errata.is_ok()) {
+    return;
+  }
+  if (server_addr_https.is_valid()) {
+    errata = do_listen(server_addr_https, TF_TLS_Accept);
   }
 }
 
@@ -387,7 +422,18 @@ int main(int argc, const char *argv[]) {
       .add_command("run", "run <dir>: the replay server using data in <dir>",
                    "", 1, [&]() -> void { engine.command_run(); })
       .add_option("--listen", "", "Listen address and port", "", 1,
-                  "127.0.0.1:8080");
+                  "")
+      .add_option("--listen-https", "", "Listen TLS address and port", "", 1,
+                  "");
+  char certfile[PATH_MAX];
+  strncpy(certfile, argv[0], sizeof(certfile));
+  dirname(certfile);
+  strncat(certfile, "/../server.pem", sizeof(certfile));
+  TLSStream::certificate_file = certfile;
+  strncpy(certfile, argv[0], sizeof(certfile));
+  dirname(certfile);
+  strncat(certfile, "/../server.key", sizeof(certfile));
+  TLSStream::privatekey_file = certfile;
   TLSStream::init();
 
   // parse the arguments
@@ -395,6 +441,7 @@ int main(int argc, const char *argv[]) {
   if (auto args{engine.arguments.get("verbose")}; args) {
     Verbose = true;
   }
+
 
   engine.arguments.invoke();
 
