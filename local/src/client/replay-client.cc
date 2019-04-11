@@ -32,6 +32,7 @@ struct Ssn {
   std::list<Txn> _txn;
   std::string _path;
   unsigned _line_no = 0;
+  uint64_t _start; ///< Start time in HR ticks.
   bool is_tls = false;
 };
 std::mutex LoadMutex;
@@ -76,8 +77,11 @@ void ClientReplayFileHandler::txn_reset() {
 
 swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
   static constexpr TextView TLS_PREFIX{"tls"};
+  swoc::Errata errata;
+
   _ssn._path = _path;
   _ssn._line_no = node.Mark().line;
+
   if (node[YAML_SSN_PROTOCOL_KEY]) {
     auto proto_node{node[YAML_SSN_PROTOCOL_KEY]};
     if (proto_node.IsSequence()) {
@@ -88,9 +92,33 @@ swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
         }
       }
     } else {
+      errata.warn(
+          R"(Session at "{}":{} has a value for "{}" that is not a sequence..)",
+          _path, _ssn._line_no, YAML_SSN_PROTOCOL_KEY);
+    }
+  } else {
+    errata.info(R"(Session at "{}":{} has no "{}" key.)", _path, _ssn._line_no,
+                YAML_SSN_PROTOCOL_KEY);
+  }
+
+  if (node[YAML_SSN_START_KEY]) {
+    auto start_node{node[YAML_SSN_START_KEY]};
+    if (start_node.IsScalar()) {
+      auto t = swoc::svtou(start_node.Scalar());
+      if (t != 0) {
+        _ssn._start = t;
+      } else {
+        errata.warn(
+            R"(Session at "{}":{} has a "{}" value "{}" that is not a positive integer.)",
+            _path, _ssn._line_no, YAML_SSN_START_KEY, start_node.Scalar());
+      }
+    } else {
+      errata.warn(R"(Session at "{}":{} has a "{}" key that is not a scalar.)",
+                  _path, _ssn._line_no, YAML_SSN_START_KEY);
     }
   }
-  return {};
+
+  return errata;
 }
 
 swoc::Errata ClientReplayFileHandler::txn_open(YAML::Node const &) {
@@ -295,9 +323,12 @@ void Engine::command_run() {
     ++n_ssn;
     n_txn += ssn._txn.size();
   }
-  auto delta = std::chrono::high_resolution_clock::now() - start;
-  erratum.info("{} transactions in {} sessions in {}.", n_txn, n_ssn,
-               std::chrono::duration_cast<std::chrono::milliseconds>(delta));
+  auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::high_resolution_clock::now() - start);
+  erratum.info("{} transactions in {} sessions (reuse {:.2f}) in {} ({:.3f} / "
+               "millisecond).",
+               n_txn, n_ssn, n_txn / static_cast<double>(n_ssn), delta,
+               n_txn / static_cast<double>(delta.count()));
 };
 
 int main(int argc, const char *argv[]) {

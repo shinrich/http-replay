@@ -44,6 +44,7 @@
 // std::string.
 static const std::string YAML_SSN_KEY{"sessions"};
 static const std::string YAML_SSN_PROTOCOL_KEY{"protocol"};
+static const std::string YAML_SSN_START_KEY{"connection-time"};
 static const std::string YAML_TXN_KEY{"transactions"};
 static const std::string YAML_CLIENT_REQ_KEY{"client-request"};
 static const std::string YAML_PROXY_REQ_KEY{"proxy-request"};
