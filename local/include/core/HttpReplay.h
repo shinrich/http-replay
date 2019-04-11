@@ -27,6 +27,9 @@
 
 #include <unistd.h>
 #include <openssl/ssl.h>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 
 #include "yaml-cpp/yaml.h"
 
@@ -388,3 +391,26 @@ template <typename... Args> void Info(swoc::TextView fmt, Args &&... args) {
     }
   }
 }
+
+class ThreadInfo {
+public:
+  std::thread *_thread = nullptr;
+  std::condition_variable _cvar;
+  std::mutex _mutex;
+  virtual bool data_ready() = 0;
+};
+
+// This must be a list so that iterators / pointers to elements do not go stale.
+class ThreadPool {
+public:
+  void wait_for_work(ThreadInfo *info);
+  ThreadInfo *get_worker();
+  virtual std::thread make_thread(std::thread *) = 0;
+protected:
+  std::list<std::thread> _allThreads;
+  // Pool of ready / idle threads.
+  std::deque<ThreadInfo *> _threadPool;
+  std::condition_variable _threadPoolCvar;
+  std::mutex _threadPoolMutex;
+};
+

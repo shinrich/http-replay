@@ -941,3 +941,44 @@ swoc::Rv<swoc::IPEndpoint> Resolve_FQDN(swoc::TextView fqdn) {
   }
   return std::move(zret);
 }
+
+void ThreadPool::wait_for_work(ThreadInfo *info) 
+{
+  // ready to roll, add to the pool.
+  {
+    std::unique_lock<std::mutex> lock(_threadPoolMutex);
+    _threadPool.push_back(info);
+    _threadPoolCvar.notify_all();
+  }
+
+  // wait for a notification there's a stream to process.
+  {
+    std::unique_lock<std::mutex> lock(info->_mutex);
+    while (!info->data_ready()) {
+      info->_cvar.wait(lock);
+    }
+  }
+}
+
+ThreadInfo *ThreadPool::get_worker() {
+  ThreadInfo *tinfo = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(this->_threadPoolMutex);
+    while (_threadPool.size() == 0) {
+      // Some ugly stuff so that the thread can put a pointer to it's @c
+      // std::thread in it's info. Circular dependency - there's no object
+      // until after the constructor is called but the constructor needs
+      // to be called to get the object. Sigh.
+      _allThreads.emplace_back();
+      // really? I have to do this to get an iterator / pointer to the
+      // element I just added?
+      std::thread *t = &*(std::prev(_allThreads.end()));
+      *t = this->make_thread(t);
+      _threadPoolCvar.wait(lock); // expect the new thread to enter
+                                   // itself in the pool and signal.
+    }
+    tinfo = _threadPool.front();
+    _threadPool.pop_front();
+  }
+  return tinfo;
+}

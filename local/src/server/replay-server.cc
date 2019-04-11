@@ -34,7 +34,7 @@
 
 using swoc::BufferWriter;
 using swoc::TextView;
-
+/*
 struct ThreadInfo {
   std::thread *_thread = nullptr;
   std::condition_variable _cvar;
@@ -48,8 +48,29 @@ std::list<std::thread> All_Threads;
 std::deque<ThreadInfo *> Thread_Pool;
 std::condition_variable Thread_Pool_CVar;
 std::mutex Thread_Pool_Mutex;
-
+*/
 std::list<std::thread *> Listen_threads;
+
+void TF_Serve(std::thread *t);
+
+class ServerThreadInfo : public ThreadInfo {
+public:
+  Stream *_stream = nullptr;
+  bool data_ready() override {
+    return this->_stream;
+  }
+};
+
+class ServerThreadPool : public ThreadPool {
+public:
+  std::thread make_thread(std::thread *t) override;
+};
+
+ServerThreadPool Server_Thread_Pool;
+
+std::thread ServerThreadPool::make_thread(std::thread *t) {
+  return std::thread(TF_Serve, t); // move the temporary into the list element for permanence.
+}
 
 /** Command execution.
  *
@@ -140,25 +161,12 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
 }
 
 void TF_Serve(std::thread *t) {
-  ThreadInfo info;
+  ServerThreadInfo info;
   info._thread = t;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
 
-    // ready to roll, add to the pool.
-    {
-      std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
-      Thread_Pool.push_back(&info);
-      Thread_Pool_CVar.notify_all();
-    }
-
-    // wait for a notification there's a stream to process.
-    {
-      std::unique_lock<std::mutex> lock(info._mutex);
-      while (!info._stream) {
-        info._cvar.wait(lock);
-      }
-    }
+    Server_Thread_Pool.wait_for_work(&info);
 
     while (!info._stream->is_closed() && errata.is_ok()) {
       HttpHeader req_hdr;
@@ -234,32 +242,16 @@ void TF_Accept(int socket_fd, bool do_tls) {
 
         errata = stream->accept();
         if (errata.is_ok()) {
-          ThreadInfo *tinfo = nullptr;
-          {
-            std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
-            while (Thread_Pool.size() == 0) {
-              // Some ugly stuff so that the thread can put a pointer to it's @c
-              // std::thread in it's info. Circular dependency - there's no object
-              // until after the constructor is called but the constructor needs
-              // to be called to get the object. Sigh.
-              All_Threads.emplace_back();
-              // really? I have to do this to get an iterator / pointer to the
-              // element I just added?
-              std::thread *t = &*(std::prev(All_Threads.end()));
-              *t = std::thread(
-                  TF_Serve,
-                  t); // move the temporary into the list element for permanence.
-              Thread_Pool_CVar.wait(lock); // expect the new thread to enter
-                                           // itself in the pool and signal.
+          ServerThreadInfo *tinfo = dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
+          if (nullptr == tinfo) {
+            std::cerr << "Failed to get worker thread\n";
+          } else {
+            // Only pointer to worker thread info.
+            {
+              std::unique_lock<std::mutex> lock(tinfo->_mutex);
+              tinfo->_stream = stream.release();
+              tinfo->_cvar.notify_one();
             }
-            tinfo = Thread_Pool.front();
-            Thread_Pool.pop_front();
-          }
-          // Only pointer to worker thread info.
-          {
-            std::unique_lock<std::mutex> lock(tinfo->_mutex);
-            tinfo->_stream = stream.release();
-            tinfo->_cvar.notify_one();
           }
         } else {
           std::cerr << errata;
