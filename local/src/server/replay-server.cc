@@ -1,7 +1,9 @@
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -10,9 +12,9 @@
 #include <bits/signum.h>
 #include <dirent.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <netinet/tcp.h>
 #include <unistd.h>
 
 #include "core/ArgParser.h"
@@ -30,6 +32,20 @@
 
 using swoc::BufferWriter;
 using swoc::TextView;
+
+struct ThreadInfo {
+  std::thread *_thread = nullptr;
+  std::condition_variable _cvar;
+  std::mutex _mutex;
+  Stream *_stream = nullptr;
+};
+
+// This must be a list so that iterators / pointers to elements do not go stale.
+std::list<std::thread> All_Threads;
+// Pool of ready / idle threads.
+std::deque<ThreadInfo *> Thread_Pool;
+std::condition_variable Thread_Pool_CVar;
+std::mutex Thread_Pool_Mutex;
 
 /** Command execution.
  *
@@ -119,56 +135,82 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
   return {};
 }
 
-void TF_Serve(Stream &stream) {
-  swoc::Errata errata;
-  bool done_p = false;
-  while (!stream.is_closed() && errata.is_ok()) {
-    HttpHeader req_hdr;
-    swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
-    auto read_result{req_hdr.read_header(stream, w)};
+void TF_Serve(std::thread *t) {
+  ThreadInfo info;
+  info._thread = t;
+  while (!Shutdown_Flag) {
+    swoc::Errata errata;
 
-    if (read_result.is_ok()) {
-      ssize_t body_offset = read_result;
-      if (0 == body_offset) {
-        break; // client closed between transactions, that's not an error.
+    // ready to roll, add to the pool.
+    {
+      std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
+      Thread_Pool.push_back(&info);
+      Thread_Pool_CVar.notify_all();
+    }
+
+    // wait for a notification there's a stream to process.
+    {
+      std::unique_lock<std::mutex> lock(info._mutex);
+      while (!info._stream) {
+        info._cvar.wait(lock);
       }
-      auto result{
-          req_hdr.parse_request(swoc::TextView(w.data(), body_offset))};
-      if (result.is_ok()) {
-        Info("Handling request");
-        auto key{req_hdr.make_key()};
-        auto spot{Transactions.find(key)};
-        if (spot != Transactions.end()) {
-          [[maybe_unused]] auto const &[key, txn] = *spot;
-          req_hdr.update_content_length();
-          req_hdr.update_transfer_encoding();
-          if (req_hdr._content_length_p || req_hdr._chunked_p) {
-            Info("Draining request body.");
-            errata =
-                req_hdr.drain_body(stream, w.view().substr(body_offset));
+    }
+
+    while (!info._stream->is_closed() && errata.is_ok()) {
+      HttpHeader req_hdr;
+      swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
+      auto read_result{req_hdr.read_header(*(info._stream), w)};
+
+      if (read_result.is_ok()) {
+        ssize_t body_offset = read_result;
+        if (0 == body_offset) {
+          break; // client closed between transactions, that's not an error.
+        }
+        auto result{
+            req_hdr.parse_request(swoc::TextView(w.data(), body_offset))};
+        if (result.is_ok()) {
+          Info("Handling request");
+          auto key{req_hdr.make_key()};
+          auto spot{Transactions.find(key)};
+          if (spot != Transactions.end()) {
+            [[maybe_unused]] auto const &[key, txn] = *spot;
+            req_hdr.update_content_length();
+            req_hdr.update_transfer_encoding();
+            if (req_hdr._content_length_p || req_hdr._chunked_p) {
+              Info("Draining request body.");
+              errata = req_hdr.drain_body(*(info._stream),
+                                          w.view().substr(body_offset));
+            }
+            Info("Responding to request - status {}.", txn._rsp._status);
+            errata = txn._rsp.transmit(*(info._stream));
+          } else {
+            errata.error(R"(Proxy request with key "{}" not found.)", key);
           }
-          Info("Responding to request - status {}.", txn._rsp._status);
-          errata = txn._rsp.transmit(stream);
         } else {
-          errata.error(R"(Proxy request with key "{}" not found.)", key);
+          errata.error(R"(Proxy request was malformed.)");
+          errata.note(result);
         }
       } else {
-        errata.error(R"(Proxy request was malformed.)");
-        errata.note(result);
+        errata.note(read_result);
+        break;
       }
-    } else {
-      errata.note(read_result);
-      break;
     }
-  }
 
-  if (!errata.is_ok()) {
-    std::cerr << errata;
+    if (!errata.is_ok()) {
+      std::cerr << errata;
+    }
+
+    // cleanup and get ready for another stream.
+    {
+      std::unique_lock<std::mutex> lock(info._mutex);
+      delete info._stream;
+      info._stream = nullptr;
+    }
   }
 }
 
 void TF_Accept(int socket_fd) {
-  Stream reader;
+  std::unique_ptr<Stream> stream;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
@@ -176,11 +218,38 @@ void TF_Accept(int socket_fd) {
     int fd =
         accept4(socket_fd, &remote_addr.sa, &remote_addr_size, SOCK_NONBLOCK);
     if (fd >= 0) {
-      errata = reader.open(fd);
+      stream.reset(new Stream);
+      errata = stream->open(fd);
       if (errata.is_ok()) {
         static const int ONE = 1;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-        TF_Serve(reader);
+        ThreadInfo *tinfo = nullptr;
+        {
+          std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
+          while (Thread_Pool.size() == 0) {
+            // Some ugly stuff so that the thread can put a pointer to it's @c
+            // std::thread in it's info. Circular dependency - there's no object
+            // until after the constructor is called but the constructor needs
+            // to be called to get the object. Sigh.
+            All_Threads.emplace_back();
+            // really? I have to do this to get an iterator / pointer to the
+            // element I just added?
+            std::thread *t = &*(std::prev(All_Threads.end()));
+            *t = std::thread(
+                TF_Serve,
+                t); // move the temporary into the list element for permanence.
+            Thread_Pool_CVar.wait(lock); // expect the new thread to enter
+                                         // itself in the pool and signal.
+          }
+          tinfo = Thread_Pool.front();
+          Thread_Pool.pop_front();
+        }
+        // Only pointer to worker thread info.
+        {
+          std::unique_lock<std::mutex> lock(tinfo->_mutex);
+          tinfo->_stream = stream.release();
+          tinfo->_cvar.notify_one();
+        }
       } else {
         std::cerr << errata;
       }

@@ -43,6 +43,7 @@
 // These need to be @c std::string or the node look up will construct a @c
 // std::string.
 static const std::string YAML_SSN_KEY{"sessions"};
+static const std::string YAML_SSN_PROTOCOL_KEY{"protocol"};
 static const std::string YAML_TXN_KEY{"transactions"};
 static const std::string YAML_CLIENT_REQ_KEY{"client-request"};
 static const std::string YAML_PROXY_REQ_KEY{"proxy-request"};
@@ -86,9 +87,9 @@ public:
   void close();
 
 protected:
-  int _fd = -1;      ///< Socket.
-  int _poll_fd = -1; ///< polling file descriptor.
-  epoll_event _epv;  ///< Event object.
+  int _fd = -1;                 ///< Socket.
+  int _poll_fd = -1;            ///< polling file descriptor.
+  epoll_event _epv{0, nullptr}; ///< Event object.
 };
 
 inline int Stream::fd() const { return _fd; }
@@ -128,15 +129,15 @@ public:
    * encoding).
    *   - An error code, which will be 0 if all data was successfully written.
    */
-  std::tuple<ssize_t, std::error_code> transmit(Stream &stream, swoc::TextView data,
-                                                size_t chunk_size = 4096);
+  std::tuple<ssize_t, std::error_code>
+  transmit(Stream &stream, swoc::TextView data, size_t chunk_size = 4096);
 
 protected:
   size_t _size = 0; ///< Size of the current chunking being decoded.
   size_t _off =
       0; ///< Number of bytes in the current chunk already sent to the callback.
   /// Buffer to hold size text in case it falls across @c parse call boundaries.
-  swoc::LocalBufferWriter<8> _size_text;
+  swoc::LocalBufferWriter<16> _size_text;
 
   /// Parsing state.
   enum class State {
@@ -192,7 +193,7 @@ public:
    *
    * @param fd Ouput stream.
    */
-  swoc::Errata transmit(Stream& stream) const;
+  swoc::Errata transmit(Stream &stream) const;
 
   /** Write the body to @a fd.
    *
@@ -201,7 +202,7 @@ public:
    *
    * This synthesizes the content based on values in the header.
    */
-  swoc::Errata transmit_body(Stream& stream) const;
+  swoc::Errata transmit_body(Stream &stream) const;
 
   /** Drain the content.
    *
@@ -217,7 +218,7 @@ public:
    * @a initial is needed for cases where part of the content is captured while
    * trying to read the header.
    */
-  swoc::Errata drain_body(Stream& stream, TextView initial) const;
+  swoc::Errata drain_body(Stream &stream, TextView initial) const;
 
   swoc::Errata load(YAML::Node const &node);
   swoc::Errata parse_fields(YAML::Node const &field_list_node);

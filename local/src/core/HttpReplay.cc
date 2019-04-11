@@ -50,9 +50,7 @@ namespace {
 }();
 }
 
-Stream::Stream() {
-  _poll_fd = epoll_create(1);
-}
+Stream::Stream() { _poll_fd = epoll_create(1); }
 
 Stream::~Stream() {
   this->close();
@@ -71,7 +69,8 @@ ssize_t Stream::read(swoc::MemSpan<char> span) {
     _epv.events = EVENTS;
     epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
   }
-  // AFAICT if the socket has been closed, both the IN and RDHUP events are set in the return.
+  // AFAICT if the socket has been closed, both the IN and RDHUP events are set
+  // in the return.
   auto result = epoll_wait(_poll_fd, &ev, 1, -1);
   if (result > 0 && ev.events & EPOLLIN) {
     n = ::read(_fd, span.data(), span.size());
@@ -89,8 +88,19 @@ ssize_t Stream::write(swoc::TextView view) {
     _epv.events = EPOLLOUT | EPOLLRDHUP;
     epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
   }
-  epoll_wait(_poll_fd, &ev, 1, -1);
-  return ::write(_fd, view.data(), view.size());
+
+  ssize_t count = 0;
+  while (view) {
+    epoll_wait(_poll_fd, &ev, 1, -1);
+    ssize_t n = ::write(_fd, view.data(), view.size());
+    if (n > 0) {
+      count += n;
+      view.remove_prefix(n);
+    } else {
+      break;
+    }
+  }
+  return count;
 }
 
 swoc::Errata Stream::open(int fd) {
@@ -100,7 +110,8 @@ swoc::Errata Stream::open(int fd) {
   _epv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
   _epv.data.ptr = static_cast<void *>(this);
   if (0 > epoll_ctl(_poll_fd, EPOLL_CTL_ADD, _fd, &_epv)) {
-    errata.error(R"(Failed to add file descriptor {} to epoll - {}.)", fd, swoc::bwf::Errno{});
+    errata.error(R"(Failed to add file descriptor {} to epoll - {}.)", fd,
+                 swoc::bwf::Errno{});
   }
   return errata;
 }
@@ -164,7 +175,7 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
 }
 
 std::tuple<ssize_t, std::error_code>
-ChunkCodex::transmit(Stream& stream, swoc::TextView data, size_t chunk_size) {
+ChunkCodex::transmit(Stream &stream, swoc::TextView data, size_t chunk_size) {
   static const std::error_code NO_ERROR;
   static constexpr swoc::TextView ZERO_CHUNK{"0\r\n"};
 
@@ -242,7 +253,7 @@ swoc::Errata HttpHeader::update_transfer_encoding() {
   return {};
 }
 
-swoc::Errata HttpHeader::transmit_body(Stream& stream) const {
+swoc::Errata HttpHeader::transmit_body(Stream &stream) const {
   swoc::Errata errata;
   ssize_t n;
   std::error_code ec;
@@ -253,7 +264,8 @@ swoc::Errata HttpHeader::transmit_body(Stream& stream) const {
   if (_content_size || (_status && !STATUS_NO_CONTENT[_status])) {
     if (_chunked_p) {
       ChunkCodex codex;
-      std::tie(n, ec) = codex.transmit(stream, {_content.data(), _content_size});
+      std::tie(n, ec) =
+          codex.transmit(stream, {_content.data(), _content_size});
     } else {
       n = stream.write({_content.data(), _content_size});
       ec = std::error_code(errno, std::system_category());
@@ -273,7 +285,7 @@ swoc::Errata HttpHeader::transmit_body(Stream& stream) const {
   return errata;
 }
 
-swoc::Errata HttpHeader::transmit(Stream& stream) const {
+swoc::Errata HttpHeader::transmit(Stream &stream) const {
   swoc::Errata errata;
 
   if (_status) {
@@ -310,7 +322,8 @@ swoc::Errata HttpHeader::transmit(Stream& stream) const {
   return errata;
 }
 
-swoc::Errata HttpHeader::drain_body(Stream &stream, swoc::TextView initial) const {
+swoc::Errata HttpHeader::drain_body(Stream &stream,
+                                    swoc::TextView initial) const {
   static constexpr size_t UNBOUNDED = std::numeric_limits<size_t>::max();
   swoc::Errata errata;
   size_t body_size = 0; // bytes drained for the content body.
@@ -340,14 +353,15 @@ swoc::Errata HttpHeader::drain_body(Stream &stream, swoc::TextView initial) cons
 
     auto result = codex.parse(initial, cb);
     while (result == ChunkCodex::CONTINUE && body_size < content_length) {
-      auto n { stream.read({buff.data(),
-               std::min<size_t>(content_length - body_size, MAX_DRAIN_BUFFER_SIZE)})};
-      if (! stream.is_closed()) {
+      auto n{
+          stream.read({buff.data(), std::min<size_t>(content_length - body_size,
+                                                     MAX_DRAIN_BUFFER_SIZE)})};
+      if (!stream.is_closed()) {
         result = codex.parse(TextView(buff.data(), n), cb);
       } else {
         if (content_length == UNBOUNDED) {
-          // Is this an error? It's chunked, so an actual close seems unexpected - should have
-          // parsed the empty chunk.
+          // Is this an error? It's chunked, so an actual close seems unexpected
+          // - should have parsed the empty chunk.
           Info("Connection closed on unbounded body.");
         } else {
           errata.error(
@@ -366,8 +380,8 @@ swoc::Errata HttpHeader::drain_body(Stream &stream, swoc::TextView initial) cons
   } else {
     body_size = initial.size();
     while (body_size < content_length) {
-      ssize_t n = stream.read({buff.data(),
-               std::min(content_length - body_size, MAX_DRAIN_BUFFER_SIZE)});
+      ssize_t n = stream.read({buff.data(), std::min(content_length - body_size,
+                                                     MAX_DRAIN_BUFFER_SIZE)});
       if (stream.is_closed()) {
         if (content_length == UNBOUNDED) {
           Info("Connection close on unbounded body");
@@ -414,7 +428,7 @@ swoc::Rv<ssize_t> HttpHeader::read_header(Stream &reader,
   Info("Reading header.");
   while (w.remaining() > 0) {
     auto n = reader.read(w.aux_span());
-    if (! reader.is_closed()) {
+    if (!reader.is_closed()) {
       // Where to start searching for the EOH string.
       size_t start =
           std::max<size_t>(w.size(), HTTP_EOH.size()) - HTTP_EOH.size();
@@ -677,12 +691,12 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
           if (ssn_list_node.IsSequence()) {
             if (ssn_list_node.size() > 0) {
               for (auto const &ssn_node : ssn_list_node) {
-                if (ssn_node[YAML_TXN_KEY]) {
-                  auto txn_list_node{ssn_node[YAML_TXN_KEY]};
-                  if (txn_list_node.IsSequence()) {
-                    if (txn_list_node.size() > 0) {
-                      auto result{handler.ssn_open(txn_list_node)};
-                      if (result.is_ok()) {
+                auto result{handler.ssn_open(ssn_node)};
+                if (result.is_ok()) {
+                  if (ssn_node[YAML_TXN_KEY]) {
+                    auto txn_list_node{ssn_node[YAML_TXN_KEY]};
+                    if (txn_list_node.IsSequence()) {
+                      if (txn_list_node.size() > 0) {
                         for (auto const &txn_node : txn_list_node) {
                           if (txn_node[YAML_PROXY_REQ_KEY] &&
                               txn_node[YAML_SERVER_RSP_KEY] &&
@@ -707,22 +721,23 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
                                 txn_node.Mark(), path);
                           }
                         }
-                        result.note(handler.ssn_close());
+                      } else {
+                        errata.info(
+                            R"(Transaction list at {} in session at {} in "{}" is an empty list.)",
+                            txn_list_node.Mark(), ssn_node.Mark(), path);
                       }
-                      errata.note(result);
                     } else {
-                      errata.info(
-                          R"(Transaction list at {} in session at {} in "{}" is an empty list.)",
+                      errata.error(
+                          R"(Transaction list at {} in session at {} in "{}" is not a list.)",
                           txn_list_node.Mark(), ssn_node.Mark(), path);
                     }
                   } else {
-                    errata.error(
-                        R"(Transaction list at {} in session at {} in "{}" is not a list.)",
-                        txn_list_node.Mark(), ssn_node.Mark(), path);
+                    errata.error(R"(Session at {} in "{}" has no "{}" key.)",
+                                 ssn_node.Mark(), path, YAML_TXN_KEY);
                   }
+                  result.note(handler.ssn_close());
                 } else {
-                  errata.error(R"(Session at {} in "{}" has no "{}" key.)",
-                               ssn_node.Mark(), path, YAML_TXN_KEY);
+                  errata.note(result);
                 }
               }
             } else {

@@ -11,8 +11,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <sys/socket.h>
 
 namespace swoc {
 inline BufferWriter &bwformat(BufferWriter &w, bwf::Spec const &spec,
@@ -32,6 +32,7 @@ struct Ssn {
   std::list<Txn> _txn;
   std::string _path;
   unsigned _line_no = 0;
+  bool is_tls = false;
 };
 std::mutex LoadMutex;
 
@@ -74,8 +75,21 @@ void ClientReplayFileHandler::txn_reset() {
 }
 
 swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
+  static constexpr TextView TLS_PREFIX{"tls"};
   _ssn._path = _path;
   _ssn._line_no = node.Mark().line;
+  if (node[YAML_SSN_PROTOCOL_KEY]) {
+    auto proto_node{node[YAML_SSN_PROTOCOL_KEY]};
+    if (proto_node.IsSequence()) {
+      for (auto const &n : proto_node) {
+        if (TextView{n.Scalar()}.starts_with_nocase(TLS_PREFIX)) {
+          _ssn.is_tls = true;
+          break;
+        }
+      }
+    } else {
+    }
+  }
   return {};
 }
 
@@ -134,9 +148,9 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
     HttpHeader rsp_hdr;
     swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
     Info("Reading response header.");
-    auto read_result { rsp_hdr.read_header(stream, w) };
+    auto read_result{rsp_hdr.read_header(stream, w)};
     if (read_result.is_ok()) {
-      ssize_t body_offset { read_result } ;
+      ssize_t body_offset{read_result};
       auto result{rsp_hdr.parse_response(TextView(w.data(), body_offset))};
       if (result.is_ok()) {
         Info("Reading response body.");
@@ -164,10 +178,10 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
   for (auto const &txn : ssn._txn) {
     if (stream.is_closed()) {
       if (socket_fd >= 0) {
-      errata.info(
-          R"(Session ["{}":{}] closed before all transactions completed.)",
-          ssn._path, ssn._line_no);
-    }
+        errata.info(
+            R"(Session ["{}":{}] closed before all transactions completed.)",
+            ssn._path, ssn._line_no);
+      }
       Info("Connecting.");
       socket_fd = socket(target.family(), SOCK_STREAM, 0);
       if (0 <= socket_fd) {

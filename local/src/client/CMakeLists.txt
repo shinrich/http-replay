@@ -4,15 +4,17 @@ project(replay-client)
 set(CMAKE_CXX_STANDARD 17)
 include(GNUInstallDirs)
 
+#set(OPENSSL_ROOT_DIR "path")
 find_package(swoc++ CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_executable(replay-client
     replay-client.cc
 )
 
-target_link_libraries(replay-client PUBLIC lib-replay-core swoc++::swoc++ yaml-cpp Threads::Threads)
+target_link_libraries(replay-client PUBLIC lib-replay-core swoc++::swoc++ yaml-cpp Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 install(TARGETS replay-client
     EXPORT replay-client-config
