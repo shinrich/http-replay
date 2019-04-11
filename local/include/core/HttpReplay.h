@@ -27,6 +27,7 @@
 
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
 
 #include "yaml-cpp/yaml.h"
 
@@ -80,12 +81,12 @@ public:
   ~Stream();
 
   int fd() const;
-  ssize_t read(swoc::MemSpan<char> span);
-  ssize_t write(swoc::TextView data);
+  virtual ssize_t read(swoc::MemSpan<char> span);
+  virtual ssize_t write(swoc::TextView data);
 
-  swoc::Errata open(int fd);
+  virtual swoc::Errata open(int fd);
   bool is_closed() const;
-  void close();
+  virtual void close();
 
 protected:
   int _fd = -1;                 ///< Socket.
@@ -95,6 +96,24 @@ protected:
 
 inline int Stream::fd() const { return _fd; }
 inline bool Stream::is_closed() const { return _fd < 0; }
+
+class TLSStream : public Stream {
+public:
+  using super = Stream;
+  virtual ssize_t read(swoc::MemSpan<char> span) override;
+  virtual ssize_t write(swoc::TextView data) override;
+
+  void close() override;
+  swoc::Errata accept();
+  swoc::Errata connect();
+  static void init();
+  static const char *certificate_file;
+  static const char *privatekey_file;
+protected:
+  SSL *_ssl = nullptr;
+  static SSL_CTX *server_ctx;
+  static SSL_CTX *client_ctx;
+};
 
 class ChunkCodex {
 public:

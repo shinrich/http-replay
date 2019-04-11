@@ -22,6 +22,9 @@
 
 #include "core/HttpReplay.h"
 
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
 #include <dirent.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -81,6 +84,38 @@ ssize_t Stream::read(swoc::MemSpan<char> span) {
   return n;
 }
 
+ssize_t TLSStream::read(swoc::MemSpan<char> span) {
+  static constexpr auto EVENTS = EPOLLIN | EPOLLRDHUP;
+  epoll_event ev;
+  ssize_t n = -1;
+  int ssl_error = 0;
+
+  do {
+   if (_epv.events != EVENTS) {
+      _epv.events = EVENTS;
+      epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
+    }
+    // AFAICT if the socket has been closed, both the IN and RDHUP events are set in the return.
+    auto result = epoll_wait(_poll_fd, &ev, 1, -1);
+    if (result > 0 && ev.events & EPOLLIN) {
+      n = SSL_read(this->_ssl, span.data(), span.size());
+      if (n <= 0) {
+        ssl_error = SSL_get_error(_ssl, n);
+      } else {
+        ssl_error = 0;
+      }
+    }
+    if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ) || !(ev.events & EPOLLIN)) {
+      fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n, SSL_get_error(_ssl, n), ERR_lib_error_string(ERR_peek_last_error()));
+      this->close();
+    } else if (n == 0) {
+      this->close();
+    }
+  } while (ssl_error == SSL_ERROR_WANT_READ);
+  return n;
+}
+
+
 ssize_t Stream::write(swoc::TextView view) {
   static constexpr auto EVENTS = EPOLLOUT | EPOLLRDHUP;
   epoll_event ev;
@@ -103,6 +138,28 @@ ssize_t Stream::write(swoc::TextView view) {
   return count;
 }
 
+ssize_t TLSStream::write(swoc::TextView view) {
+  static constexpr auto EVENTS = EPOLLOUT | EPOLLRDHUP;
+  int total_size = view.size();
+  int num_written = 0;
+  while (num_written < total_size) { 
+    epoll_event ev;
+    if (_epv.events != EVENTS) {
+      _epv.events = EPOLLOUT | EPOLLRDHUP;
+      epoll_ctl(_poll_fd, EPOLL_CTL_MOD, _fd, &_epv);
+    }
+    epoll_wait(_poll_fd, &ev, 1, -1);
+    int n = SSL_write(this->_ssl, view.data() + num_written, view.size() - num_written);
+    if (n <= 0 || !(ev.events & EPOLLOUT)) {
+      fprintf(stderr, "write failed: %s\n", ERR_lib_error_string(ERR_peek_last_error()));
+      return n;
+    } else {
+      num_written += n;
+    } 
+  }
+  return num_written;
+}
+
 swoc::Errata Stream::open(int fd) {
   swoc::Errata errata;
   this->close();
@@ -116,11 +173,76 @@ swoc::Errata Stream::open(int fd) {
   return errata;
 }
 
+// Complate the TLS handshake
+swoc::Errata TLSStream::accept() {
+  swoc::Errata errata;
+  _ssl = SSL_new(server_ctx);
+  if (_ssl == nullptr) {
+    errata.error(R"(Failed to create SSL server object fd={} server_ctx={} err={}.)", _fd, server_ctx, ERR_lib_error_string(ERR_peek_last_error()));
+  } else {
+    BIO *bio = BIO_new_fd(_fd, BIO_NOCLOSE);
+    SSL_set_bio(_ssl, bio, bio);
+    int retval = SSL_accept(_ssl);  
+    if (retval <= 0) {
+      errata.error(R"(Failed SSL_accept {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
+    }
+  }
+  return errata;
+}
+
+// Complate the TLS handshake
+swoc::Errata TLSStream::connect() {
+  swoc::Errata errata;
+  _ssl = SSL_new(client_ctx);
+  if (_ssl == nullptr) {
+    errata.error(R"(Failed to create SSL client object fd={} client_ctx={} err={}.)", _fd, client_ctx, ERR_lib_error_string(ERR_peek_last_error()));
+  } else {
+    SSL_set_fd(_ssl, _fd);
+    int retval = SSL_connect(_ssl);  
+    if (retval <= 0) {
+      errata.error(R"(Failed SSL_connect {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
+    }
+  }
+  return errata;
+}
+
+
 void Stream::close() {
   if (!this->is_closed()) {
     epoll_ctl(_poll_fd, EPOLL_CTL_DEL, _fd, &_epv);
     ::close(_fd);
     _fd = -1;
+  }
+}
+
+void TLSStream::close() {
+  if (!this->is_closed()) {
+    if (_ssl != nullptr) {
+      SSL_free(_ssl);
+      _ssl = nullptr;
+    }
+    super::close();
+  }
+}
+
+const char *TLSStream::certificate_file = "/home/shinrich/server.pem";
+const char *TLSStream::privatekey_file = "/home/shinrich/server.key";
+SSL_CTX * TLSStream::server_ctx = nullptr;
+SSL_CTX * TLSStream::client_ctx = nullptr;
+
+void TLSStream::init() {
+  SSL_load_error_strings();
+  SSL_library_init();
+
+  server_ctx = SSL_CTX_new(TLS_server_method());
+  if (!SSL_CTX_use_certificate_file(server_ctx, TLSStream::certificate_file, SSL_FILETYPE_PEM)) {
+    fprintf(stderr, "Failed to load cert from %s, %s\n", TLSStream::certificate_file, ERR_lib_error_string(ERR_peek_last_error()));
+  } else if (!SSL_CTX_use_PrivateKey_file(server_ctx, TLSStream::privatekey_file, SSL_FILETYPE_PEM)) {
+    fprintf(stderr, "Failed to load private key from %s, %s\n", TLSStream::privatekey_file, ERR_lib_error_string(ERR_peek_last_error()));
+  }
+  client_ctx = SSL_CTX_new(TLS_client_method());
+  if (!client_ctx) {
+    fprintf(stderr, "Failed to create client_ctx %s\n", ERR_lib_error_string(ERR_peek_last_error()));
   }
 }
 

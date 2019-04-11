@@ -199,7 +199,7 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
 swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
   swoc::Errata errata;
   int socket_fd = -2;
-  Stream stream;
+  TLSStream stream;
 
   Info(R"(Starting session "{}":{}.)", ssn._path, ssn._line_no);
 
@@ -217,13 +217,19 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target) {
         if (errata.is_ok()) {
           if (0 == connect(socket_fd, &target.sa, target.size())) {
             static const int ONE = 1;
+            setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+            errata = stream.connect();
             int flags = fcntl(socket_fd, F_GETFL, 0);
             fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
-            setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+            if (!errata.is_ok()) {
+              break; 
+            } 
           } else {
-            errata.error(R"(Failed to connect to {} - {}.)", target,
-                         swoc::bwf::Errno{});
+            errata.error(R"(Failed to connect socket - {})", swoc::bwf::Errno{});
+            break;
           }
+        } else {
+          break;
         }
       } else {
         errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
@@ -294,6 +300,9 @@ void Engine::command_run() {
   if (!result.is_ok()) {
     return;
   }
+
+  Info(R"(Initialize TLS)");
+  TLSStream::init();
 
   // After this, any string expected to be localized that isn't is an error,
   // so lock down the local string storage to avoid locking and report an

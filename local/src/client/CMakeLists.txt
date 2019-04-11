@@ -4,7 +4,10 @@ project(replay-client)
 set(CMAKE_CXX_STANDARD 17)
 include(GNUInstallDirs)
 
-#set(OPENSSL_ROOT_DIR "path")
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+
+set(OPENSSL_ROOT_DIR /opt/oath/openssl/1.1.1)
+find_package(OpenSSL REQUIRED)
 find_package(swoc++ CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 find_package(Threads REQUIRED)

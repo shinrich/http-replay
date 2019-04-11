@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "core/ArgParser.h"
 #include "core/HttpReplay.h"
@@ -209,6 +210,37 @@ void TF_Serve(std::thread *t) {
   }
 }
 
+void TF_TLS_Accept(int socket_fd) {
+  TLSStream reader;
+  while (!Shutdown_Flag) {
+    swoc::Errata errata;
+    swoc::IPEndpoint remote_addr;
+    socklen_t remote_addr_size;
+    int fd =
+        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
+    if (fd >= 0) {
+      // The tls version of open will create the SSL object and bind the file descriptor
+      // And make the blockig call to SSL_accept
+      errata = reader.open(fd);
+      if (errata.is_ok()) {
+        static const int ONE = 1;
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+
+        errata = reader.accept(); // Do the handshake
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | SOCK_NONBLOCK);
+        if (errata.is_ok()) {
+          TF_Serve(reader);
+        } else {
+          std::cerr << errata;
+        }
+      } else {
+        std::cerr << errata;
+      }
+    }
+  }
+}
+
 void TF_Accept(int socket_fd) {
   std::unique_ptr<Stream> stream;
   while (!Shutdown_Flag) {
@@ -321,7 +353,7 @@ void Engine::command_run() {
       int listen_result = listen(socket_fd, 1);
       if (listen_result == 0) {
         Info(R"(Listening at {})", server_addr);
-        std::thread runner{TF_Accept, socket_fd};
+        std::thread runner{TF_TLS_Accept, socket_fd};
         runner.join();
       } else {
         errata.error(R"(Could not listen to {} - {}.)", server_addr,
@@ -351,6 +383,7 @@ int main(int argc, const char *argv[]) {
                    "", 1, [&]() -> void { engine.command_run(); })
       .add_option("--listen", "", "Listen address and port", "", 1,
                   "127.0.0.1:8080");
+  TLSStream::init();
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
