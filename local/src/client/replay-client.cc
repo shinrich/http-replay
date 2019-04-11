@@ -37,7 +37,7 @@ struct Ssn {
 };
 std::mutex LoadMutex;
 
-std::list<Ssn> Session_List;
+std::list<Ssn *> Session_List;
 
 bool Proxy_Mode = false;
 
@@ -56,7 +56,7 @@ class ClientReplayFileHandler : public ReplayFileHandler {
   void ssn_reset();
 
   std::string _path;
-  Ssn _ssn;
+  Ssn *_ssn;
   Txn _txn;
 };
 
@@ -66,8 +66,7 @@ swoc::Errata ClientReplayFileHandler::file_open(swoc::file::path const &path) {
 }
 
 void ClientReplayFileHandler::ssn_reset() {
-  _ssn.~Ssn();
-  new (&_ssn) Ssn;
+  _ssn = nullptr;
 }
 
 void ClientReplayFileHandler::txn_reset() {
@@ -78,26 +77,26 @@ void ClientReplayFileHandler::txn_reset() {
 swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
   static constexpr TextView TLS_PREFIX{"tls"};
   swoc::Errata errata;
-
-  _ssn._path = _path;
-  _ssn._line_no = node.Mark().line;
+  _ssn = new Ssn();
+  _ssn->_path = _path;
+  _ssn->_line_no = node.Mark().line;
 
   if (node[YAML_SSN_PROTOCOL_KEY]) {
     auto proto_node{node[YAML_SSN_PROTOCOL_KEY]};
     if (proto_node.IsSequence()) {
       for (auto const &n : proto_node) {
         if (TextView{n.Scalar()}.starts_with_nocase(TLS_PREFIX)) {
-          _ssn.is_tls = true;
+          _ssn->is_tls = true;
           break;
         }
       }
     } else {
       errata.warn(
           R"(Session at "{}":{} has a value for "{}" that is not a sequence..)",
-          _path, _ssn._line_no, YAML_SSN_PROTOCOL_KEY);
+          _path, _ssn->_line_no, YAML_SSN_PROTOCOL_KEY);
     }
   } else {
-    errata.info(R"(Session at "{}":{} has no "{}" key.)", _path, _ssn._line_no,
+    errata.info(R"(Session at "{}":{} has no "{}" key.)", _path, _ssn->_line_no,
                 YAML_SSN_PROTOCOL_KEY);
   }
 
@@ -106,15 +105,15 @@ swoc::Errata ClientReplayFileHandler::ssn_open(YAML::Node const &node) {
     if (start_node.IsScalar()) {
       auto t = swoc::svtou(start_node.Scalar());
       if (t != 0) {
-        _ssn._start = t;
+        _ssn->_start = t;
       } else {
         errata.warn(
             R"(Session at "{}":{} has a "{}" value "{}" that is not a positive integer.)",
-            _path, _ssn._line_no, YAML_SSN_START_KEY, start_node.Scalar());
+            _path, _ssn->_line_no, YAML_SSN_START_KEY, start_node.Scalar());
       }
     } else {
       errata.warn(R"(Session at "{}":{} has a "{}" key that is not a scalar.)",
-                  _path, _ssn._line_no, YAML_SSN_START_KEY);
+                  _path, _ssn->_line_no, YAML_SSN_START_KEY);
     }
   }
 
@@ -155,7 +154,7 @@ swoc::Errata ClientReplayFileHandler::server_response(YAML::Node const &node) {
 }
 
 swoc::Errata ClientReplayFileHandler::txn_close() {
-  _ssn._txn.emplace_back(std::move(_txn));
+  _ssn->_txn.emplace_back(std::move(_txn));
   LoadMutex.unlock();
   return {};
 }
@@ -163,7 +162,7 @@ swoc::Errata ClientReplayFileHandler::txn_close() {
 swoc::Errata ClientReplayFileHandler::ssn_close() {
   {
     std::lock_guard<std::mutex> lock(LoadMutex);
-    Session_List.emplace_back(std::move(_ssn));
+    Session_List.push_back(_ssn);
   }
   this->ssn_reset();
   return {};
@@ -256,6 +255,11 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::I
   return std::move(errata);
 }
 
+bool session_start_compare(const Ssn *ssn1, const Ssn *ssn2) 
+{
+  return ssn1->_start < ssn2->_start;
+}
+
 /** Command execution.
  *
  * This handles parsing and acting on the command line arguments.
@@ -292,6 +296,7 @@ void Engine::command_run() {
     Proxy_Mode = true;
   }
 
+
   auto &&[target, target_result] = Resolve_FQDN(args[1]);
   if (!target_result.is_ok()) {
     return;
@@ -316,24 +321,43 @@ void Engine::command_run() {
   Info(R"(Initialize TLS)");
   TLSStream::init();
 
+  // Sort the Session_List and adjust the time offsets
+  Session_List.sort(session_start_compare);
+
+
   // After this, any string expected to be localized that isn't is an error,
   // so lock down the local string storage to avoid locking and report an
   // error instead if not found.
   HttpHeader::_frozen = true;
   size_t max_content_length = 0;
-  for (auto const &ssn : Session_List) {
-    for (auto const &txn : ssn._txn) {
+  uint64_t offset_time = 0; 
+  int transaction_count = 0;
+  if (!Session_List.empty()) {
+    offset_time = Session_List.front()->_start;
+  }
+  for (auto *ssn : Session_List) {
+    ssn->_start -= offset_time;
+    transaction_count += ssn->_txn.size();
+    for (auto const &txn : ssn->_txn) {
       max_content_length =
           std::max<size_t>(max_content_length, txn._req._content_size);
     }
   }
   HttpHeader::set_max_content_length(max_content_length);
 
+  float rate_multiplier = 0.0;
+  auto rate_arg{arguments.get("rate")};
+  if (rate_arg.size() == 1 && !Session_List.empty()) {
+    int target = atoi(rate_arg[0].c_str());
+    rate_multiplier = (transaction_count * 1000000000.0)/(target*Session_List.back()->_start);
+  }
+  std::cout << "Rate multiplier is " << rate_multiplier << " Transaction count is " << transaction_count << " Time delta " << Session_List.back()->_start << " first time " << offset_time << "\n";
+
   auto start = std::chrono::high_resolution_clock::now();
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
-  for (auto const &ssn : Session_List) {
-    result = Run_Session(ssn, target, target_https);
+  for (auto const *ssn : Session_List) {
+    result = Run_Session(*ssn, target, target_https);
     if (!result.is_ok()) {
       std::cerr << result;
       break;
@@ -342,7 +366,7 @@ void Engine::command_run() {
       std::cout << result;
     }
     ++n_ssn;
-    n_txn += ssn._txn.size();
+    n_txn += ssn->_txn.size();
   }
   auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::high_resolution_clock::now() - start);
@@ -363,7 +387,8 @@ int main(int argc, const char *argv[]) {
       .add_command(Engine::COMMAND_RUN.data(), Engine::COMMAND_RUN_ARGS.data(),
                    "", MORE_THAN_ONE_ARG_N,
                    [&]() -> void { engine.command_run(); })
-      .add_option("--no-proxy", "", "Use proxy data instead of client data.");
+      .add_option("--no-proxy", "", "Use proxy data instead of client data.")
+      .add_option("--rate", "", "Specify desired transacton rate", "", 1, "");
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
