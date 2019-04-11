@@ -49,6 +49,8 @@ std::deque<ThreadInfo *> Thread_Pool;
 std::condition_variable Thread_Pool_CVar;
 std::mutex Thread_Pool_Mutex;
 
+std::list<std::thread *> Listen_threads;
+
 /** Command execution.
  *
  * This handles parsing and acting on the command line arguments.
@@ -211,8 +213,8 @@ void TF_Serve(std::thread *t) {
   }
 }
 
-void TF_TLS_Accept(int socket_fd) {
-  TLSStream reader;
+void TF_Accept(int socket_fd, bool do_tls) {
+  std::unique_ptr<Stream> stream;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
@@ -220,16 +222,45 @@ void TF_TLS_Accept(int socket_fd) {
     int fd =
         accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
     if (fd >= 0) {
-      // The tls version of open will create the SSL object and bind the file descriptor
-      // And make the blockig call to SSL_accept
-      errata = reader.open(fd);
+      if (do_tls) {
+        stream.reset(new TLSStream);
+      } else {
+        stream.reset(new Stream);
+      }
+      errata = stream->open(fd);
       if (errata.is_ok()) {
         static const int ONE = 1;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
 
-        errata = reader.accept(); // Do the handshake
+        errata = stream->accept();
         if (errata.is_ok()) {
-          TF_Serve(reader);
+          ThreadInfo *tinfo = nullptr;
+          {
+            std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
+            while (Thread_Pool.size() == 0) {
+              // Some ugly stuff so that the thread can put a pointer to it's @c
+              // std::thread in it's info. Circular dependency - there's no object
+              // until after the constructor is called but the constructor needs
+              // to be called to get the object. Sigh.
+              All_Threads.emplace_back();
+              // really? I have to do this to get an iterator / pointer to the
+              // element I just added?
+              std::thread *t = &*(std::prev(All_Threads.end()));
+              *t = std::thread(
+                  TF_Serve,
+                  t); // move the temporary into the list element for permanence.
+              Thread_Pool_CVar.wait(lock); // expect the new thread to enter
+                                           // itself in the pool and signal.
+            }
+            tinfo = Thread_Pool.front();
+            Thread_Pool.pop_front();
+          }
+          // Only pointer to worker thread info.
+          {
+            std::unique_lock<std::mutex> lock(tinfo->_mutex);
+            tinfo->_stream = stream.release();
+            tinfo->_cvar.notify_one();
+          }
         } else {
           std::cerr << errata;
         }
@@ -240,56 +271,8 @@ void TF_TLS_Accept(int socket_fd) {
   }
 }
 
-void TF_Accept(int socket_fd) {
-  std::unique_ptr<Stream> stream;
-  while (!Shutdown_Flag) {
-    swoc::Errata errata;
-    swoc::IPEndpoint remote_addr;
-    socklen_t remote_addr_size;
-    int fd =
-        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
-    if (fd >= 0) {
-      stream.reset(new Stream);
-      errata = stream->open(fd);
-      if (errata.is_ok()) {
-        static const int ONE = 1;
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-        ThreadInfo *tinfo = nullptr;
-        {
-          std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
-          while (Thread_Pool.size() == 0) {
-            // Some ugly stuff so that the thread can put a pointer to it's @c
-            // std::thread in it's info. Circular dependency - there's no object
-            // until after the constructor is called but the constructor needs
-            // to be called to get the object. Sigh.
-            All_Threads.emplace_back();
-            // really? I have to do this to get an iterator / pointer to the
-            // element I just added?
-            std::thread *t = &*(std::prev(All_Threads.end()));
-            *t = std::thread(
-                TF_Serve,
-                t); // move the temporary into the list element for permanence.
-            Thread_Pool_CVar.wait(lock); // expect the new thread to enter
-                                         // itself in the pool and signal.
-          }
-          tinfo = Thread_Pool.front();
-          Thread_Pool.pop_front();
-        }
-        // Only pointer to worker thread info.
-        {
-          std::unique_lock<std::mutex> lock(tinfo->_mutex);
-          tinfo->_stream = stream.release();
-          tinfo->_cvar.notify_one();
-        }
-      } else {
-        std::cerr << errata;
-      }
-    }
-  }
-}
-
 swoc::Errata
-do_listen(swoc::IPEndpoint &server_addr, void (*accept_func)(int))
+do_listen(swoc::IPEndpoint &server_addr, bool do_tls) 
 {
   swoc::Errata errata;
   int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
@@ -305,8 +288,8 @@ do_listen(swoc::IPEndpoint &server_addr, void (*accept_func)(int))
         int listen_result = listen(socket_fd, 1);
         if (listen_result == 0) {
           Info(R"(Listening at {})", server_addr);
-          std::thread runner{accept_func, socket_fd};
-          runner.join();
+          std::thread *runner = new std::thread{TF_Accept, socket_fd, do_tls};
+          Listen_threads.push_back(runner);
         } else {
           errata.error(R"(Could not isten to {} - {}.)", server_addr,
                        swoc::bwf::Errno{});
@@ -319,7 +302,7 @@ do_listen(swoc::IPEndpoint &server_addr, void (*accept_func)(int))
   } else {
     errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
   }
-  if (socket_fd >= 0) {
+  if (!errata.is_ok() && socket_fd >= 0) {
     close(socket_fd);
   }
   return errata;
@@ -401,13 +384,18 @@ void Engine::command_run() {
 
   // Set up listen port.
   if (server_addr.is_valid()) {
-    errata = do_listen(server_addr, TF_Accept);
+    errata = do_listen(server_addr, false);
   }
   if (!errata.is_ok()) {
     return;
   }
   if (server_addr_https.is_valid()) {
-    errata = do_listen(server_addr_https, TF_TLS_Accept);
+    errata = do_listen(server_addr_https, true);
+  }
+
+  // Don't exit until all the listen threads go away
+  while (true) {
+    sleep(10);
   }
 }
 

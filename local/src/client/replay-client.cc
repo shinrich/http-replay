@@ -199,26 +199,35 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
 swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::IPEndpoint const &target_https) {
   swoc::Errata errata;
   int socket_fd = -2;
-  TLSStream stream;
+  std::unique_ptr<Stream> stream;
+  const swoc::IPEndpoint *real_target;
 
   Info(R"(Starting session "{}":{}.)", ssn._path, ssn._line_no);
 
+  if (ssn.is_tls) {
+    stream.reset(new TLSStream());
+    real_target = &target_https;
+  } else {
+    stream.reset(new Stream());
+    real_target = &target;
+  }
+
   for (auto const &txn : ssn._txn) {
-    if (stream.is_closed()) {
+    if (stream->is_closed()) {
       if (socket_fd >= 0) {
         errata.info(
             R"(Session ["{}":{}] closed before all transactions completed.)",
             ssn._path, ssn._line_no);
       }
       Info("Connecting.");
-      socket_fd = socket(target.family(), SOCK_STREAM, 0);
+      socket_fd = socket(real_target->family(), SOCK_STREAM, 0);
       if (0 <= socket_fd) {
-        errata = stream.open(socket_fd);
+        errata = stream->open(socket_fd);
         if (errata.is_ok()) {
-          if (0 == connect(socket_fd, &target.sa, target.size())) {
+          if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
             static const int ONE = 1;
             setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-            errata = stream.connect();
+            errata = stream->connect();
             if (!errata.is_ok()) {
               break; 
             } 
@@ -236,7 +245,7 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::I
     }
 
     if (errata.is_ok()) {
-      errata = Run_Transaction(stream, txn);
+      errata = Run_Transaction(*stream, txn);
     } else {
       break;
     }

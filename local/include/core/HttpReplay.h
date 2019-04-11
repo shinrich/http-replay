@@ -82,6 +82,8 @@ public:
   int fd() const;
   virtual ssize_t read(swoc::MemSpan<char> span);
   virtual ssize_t write(swoc::TextView data);
+  virtual swoc::Errata accept();
+  virtual swoc::Errata connect();
 
   virtual swoc::Errata open(int fd);
   bool is_closed() const;
@@ -101,8 +103,8 @@ public:
   virtual ssize_t write(swoc::TextView data) override;
 
   void close() override;
-  swoc::Errata accept();
-  swoc::Errata connect();
+  swoc::Errata accept() override;
+  swoc::Errata connect() override;
   static void init();
   static std::string certificate_file;
   static std::string privatekey_file;

@@ -113,6 +113,10 @@ swoc::Errata Stream::open(int fd) {
   return errata;
 }
 
+swoc::Errata Stream::accept() {
+  swoc::Errata errata;
+  return errata;
+}
 // Complate the TLS handshake
 swoc::Errata TLSStream::accept() {
   swoc::Errata errata;
@@ -126,6 +130,11 @@ swoc::Errata TLSStream::accept() {
       errata.error(R"(Failed SSL_accept {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
     }
   }
+  return errata;
+}
+
+swoc::Errata Stream::connect() {
+  swoc::Errata errata;
   return errata;
 }
 
