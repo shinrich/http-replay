@@ -40,6 +40,8 @@ std::mutex LoadMutex;
 
 std::list<Ssn *> Session_List;
 
+swoc::IPEndpoint Target, Target_Https;
+
 bool Proxy_Mode = false;
 
 class ClientReplayFileHandler : public ReplayFileHandler {
@@ -60,6 +62,29 @@ class ClientReplayFileHandler : public ReplayFileHandler {
   Ssn *_ssn;
   Txn _txn;
 };
+
+class ClientThreadInfo : public ThreadInfo {
+public:
+  Ssn *_ssn = nullptr;
+  bool data_ready() override {
+    return this->_ssn;
+  }
+};
+
+class ClientThreadPool : public ThreadPool {
+public:
+  std::thread make_thread(std::thread *t) override;
+};
+
+ClientThreadPool Client_Thread_Pool;
+
+bool Shutdown_Flag = false;
+
+void TF_Client(std::thread *t);
+
+std::thread ClientThreadPool::make_thread(std::thread *t) {
+  return std::thread(TF_Client, t); // move the temporary into the list element for permanence.
+}
 
 swoc::Errata ClientReplayFileHandler::file_open(swoc::file::path const &path) {
   _path = path.string();
@@ -196,6 +221,29 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
   return errata;
 }
 
+swoc::Errata do_connect(Stream *stream, const swoc::IPEndpoint *real_target) {
+  swoc::Errata errata;
+  int socket_fd = socket(real_target->family(), SOCK_STREAM, 0);
+  if (0 <= socket_fd) { 
+    errata = stream->open(socket_fd);
+    if (errata.is_ok()) {
+      if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
+        static const int ONE = 1;
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+        errata = stream->connect();
+      } else {
+        errata.error(R"(Failed to connect socket - {})", swoc::bwf::Errno{});
+      }
+    }
+    else {
+      errata.error(R"(Failed to open stream - {})", swoc::bwf::Errno{});
+    }  
+  } else {
+    errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+  }
+  return errata;
+}
+
 swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::IPEndpoint const &target_https) {
   swoc::Errata errata;
   int socket_fd = -2;
@@ -212,42 +260,18 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::I
     real_target = &target;
   }
 
-  for (auto const &txn : ssn._txn) {
-    if (stream->is_closed()) {
-      if (socket_fd >= 0) {
-        errata.info(
-            R"(Session ["{}":{}] closed before all transactions completed.)",
-            ssn._path, ssn._line_no);
+  Info("Connecting.");
+  errata = do_connect(stream.get(), real_target);
+  if (errata.is_ok()) {
+    for (auto const &txn : ssn._txn) {
+      if (stream->is_closed()) {
+        errata = do_connect(stream.get(), real_target);
       }
-      Info("Connecting.");
-      socket_fd = socket(real_target->family(), SOCK_STREAM, 0);
-      if (0 <= socket_fd) {
-        errata = stream->open(socket_fd);
-        if (errata.is_ok()) {
-          if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
-            static const int ONE = 1;
-            setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-            errata = stream->connect();
-            if (!errata.is_ok()) {
-              break; 
-            } 
-          } else {
-            errata.error(R"(Failed to connect socket - {})", swoc::bwf::Errno{});
-            break;
-          }
-        } else {
-          break;
-        }
+      if (errata.is_ok()) {
+        errata = Run_Transaction(*stream, txn);
       } else {
-        errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
         break;
       }
-    }
-
-    if (errata.is_ok()) {
-      errata = Run_Transaction(*stream, txn);
-    } else {
-      break;
     }
   }
   if (0 <= socket_fd) {
@@ -256,6 +280,22 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::I
   return std::move(errata);
 }
 
+void TF_Client(std::thread *t) {
+  ClientThreadInfo info;
+  info._thread = t;
+  while (!Shutdown_Flag) {
+    swoc::Errata errata;
+    info._ssn = nullptr;
+    Client_Thread_Pool.wait_for_work(&info);
+
+    if (info._ssn != nullptr) {
+        swoc::Errata result = Run_Session(*info._ssn, Target, Target_Https);
+        if (!result.is_ok()) {
+          std::cerr << result;
+        }
+    }
+  }  
+}
 bool session_start_compare(const Ssn *ssn1, const Ssn *ssn2) 
 {
   return ssn1->_start < ssn2->_start;
@@ -304,14 +344,16 @@ void Engine::command_run() {
   }
 
 
-  auto &&[target, target_result] = Resolve_FQDN(args[1]);
-  if (!target_result.is_ok()) {
+  auto &&[tmp_target, result_http] = Resolve_FQDN(args[1]);
+  if (!result_http.is_ok()) {
     return;
   }
-  auto &&[target_https, target_result_https] = Resolve_FQDN(args[2]);
-  if (!target_result_https.is_ok()) {
+  Target = tmp_target;
+  auto &&[tmp_target_https, result_https] = Resolve_FQDN(args[2]);
+  if (!result_https.is_ok()) {
     return;
   }
+  Target_Https = tmp_target_https;
 
   Info(R"(Loading directory "{}".)", args[0]);
   auto result =
@@ -364,10 +406,26 @@ void Engine::command_run() {
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
   uint64_t lasttime = GetUTimestamp();
-  for (auto const *ssn : Session_List) {
+  for (auto *ssn : Session_List) {
     uint64_t curtime = GetUTimestamp();
-    uint64_t nexttime = rate_multiplier * (lasttime + ssn->_start);
+    uint64_t nexttime = rate_multiplier * ssn->_start + lasttime;
+    if (nexttime > curtime) {
+      //std::cout << "Sleep " << nexttime - curtime << " ms " << nexttime << " " << curtime << "\n";
+      //usleep(nexttime - curtime);
+    }
     lasttime = GetUTimestamp();
+    ClientThreadInfo *tinfo = dynamic_cast<ClientThreadInfo *>(Client_Thread_Pool.get_worker());
+    if (nullptr == tinfo) {
+      std::cerr << "Failed to get worker thread\n";
+    } else {
+      // Only pointer to worker thread info.
+      {
+        std::unique_lock<std::mutex> lock(tinfo->_mutex);
+        tinfo->_ssn = ssn;
+        tinfo->_cvar.notify_one();
+      }
+    }    
+/*
     result = Run_Session(*ssn, target, target_https);
     if (!result.is_ok()) {
       std::cerr << result;
@@ -376,9 +434,14 @@ void Engine::command_run() {
     if (result.count() && Verbose) {
       std::cout << result;
     }
+*/
     ++n_ssn;
     n_txn += ssn->_txn.size();
   }
+  // Wait until all threads are done
+  Shutdown_Flag = true;
+  Client_Thread_Pool.join_threads();
+
   auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::high_resolution_clock::now() - start);
   erratum.info("{} transactions in {} sessions (reuse {:.2f}) in {} ({:.3f} / "

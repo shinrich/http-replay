@@ -72,17 +72,15 @@ ssize_t TLSStream::read(swoc::MemSpan<char> span) {
   ssize_t n = -1;
   int ssl_error = 0;
 
-  do {
-    n = SSL_read(this->_ssl, span.data(), span.size());
-    ssl_error = (n <= 0) ? SSL_get_error(_ssl, n) : 0;
+  n = SSL_read(this->_ssl, span.data(), span.size());
+  ssl_error = (n <= 0) ? SSL_get_error(_ssl, n) : 0;
 
-    if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ)) {
-      fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n, SSL_get_error(_ssl, n), ERR_lib_error_string(ERR_peek_last_error()));
-      this->close();
-    } else if (n == 0) {
-      this->close();
-    }
-  } while (ssl_error == SSL_ERROR_WANT_READ);
+  if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ)) {
+    fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n, SSL_get_error(_ssl, n), ERR_lib_error_string(ERR_peek_last_error()));
+    this->close();
+  } else if (n == 0) {
+    this->close();
+  }
   return n;
 }
 
@@ -127,7 +125,7 @@ swoc::Errata TLSStream::accept() {
     SSL_set_fd(_ssl, _fd);
     int retval = SSL_accept(_ssl);  
     if (retval <= 0) {
-      errata.error(R"(Failed SSL_accept {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
+      errata.error(R"(Failed SSL_accept {} {} {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
     }
   }
   return errata;
@@ -148,7 +146,7 @@ swoc::Errata TLSStream::connect() {
     SSL_set_fd(_ssl, _fd);
     int retval = SSL_connect(_ssl);  
     if (retval <= 0) {
-      errata.error(R"(Failed SSL_connect {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()));
+      errata.error(R"(Failed SSL_connect {} {} {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
     }
   }
   return errata;
@@ -406,7 +404,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
   static constexpr size_t UNBOUNDED = std::numeric_limits<size_t>::max();
   swoc::Errata errata;
   size_t body_size = 0; // bytes drained for the content body.
-  static std::string buff;
+  std::string buff;
   size_t content_length = _content_length_p ? _content_size : UNBOUNDED;
   if (content_length < initial.size()) {
     errata.error(
@@ -421,6 +419,10 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
   }
 
   buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
+
+  if (stream.is_closed()) {
+      errata.error(R"(drain_body: stream closed)");
+  }
 
   if (_chunked_p) {
     ChunkCodex::ChunkCallback cb{
@@ -965,20 +967,37 @@ ThreadInfo *ThreadPool::get_worker() {
   {
     std::unique_lock<std::mutex> lock(this->_threadPoolMutex);
     while (_threadPool.size() == 0) {
-      // Some ugly stuff so that the thread can put a pointer to it's @c
-      // std::thread in it's info. Circular dependency - there's no object
-      // until after the constructor is called but the constructor needs
-      // to be called to get the object. Sigh.
-      _allThreads.emplace_back();
-      // really? I have to do this to get an iterator / pointer to the
-      // element I just added?
-      std::thread *t = &*(std::prev(_allThreads.end()));
-      *t = this->make_thread(t);
-      _threadPoolCvar.wait(lock); // expect the new thread to enter
-                                   // itself in the pool and signal.
+      if (_allThreads.size() > max_threads) {
+        // Just sleep until a thread comes back
+        _threadPoolCvar.wait(lock); 
+      } else { // Make a new thread
+        // Some ugly stuff so that the thread can put a pointer to it's @c
+        // std::thread in it's info. Circular dependency - there's no object
+        // until after the constructor is called but the constructor needs
+        // to be called to get the object. Sigh.
+        _allThreads.emplace_back();
+        // really? I have to do this to get an iterator / pointer to the
+        // element I just added?
+        std::thread *t = &*(std::prev(_allThreads.end()));
+        *t = this->make_thread(t);
+        _threadPoolCvar.wait(lock); // expect the new thread to enter
+                                    // itself in the pool and signal.
+      }
     }
     tinfo = _threadPool.front();
     _threadPool.pop_front();
   }
   return tinfo;
+}
+
+void ThreadPool::join_threads() {
+  std::unique_lock<std::mutex> lock(_threadPoolMutex);
+  for (auto info: _threadPool) {
+    info->_cvar.notify_one();
+  }
+  while (!_allThreads.empty()) {
+    std::thread *thread = &_allThreads.front();
+    thread->join();
+    _allThreads.pop_front();
+  }
 }

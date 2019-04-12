@@ -168,6 +168,7 @@ void TF_Serve(std::thread *t) {
 
     Server_Thread_Pool.wait_for_work(&info);
 
+    errata = info._stream->accept();
     while (!info._stream->is_closed() && errata.is_ok()) {
       HttpHeader req_hdr;
       swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
@@ -240,21 +241,16 @@ void TF_Accept(int socket_fd, bool do_tls) {
         static const int ONE = 1;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
 
-        errata = stream->accept();
-        if (errata.is_ok()) {
-          ServerThreadInfo *tinfo = dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
-          if (nullptr == tinfo) {
-            std::cerr << "Failed to get worker thread\n";
-          } else {
-            // Only pointer to worker thread info.
-            {
-              std::unique_lock<std::mutex> lock(tinfo->_mutex);
-              tinfo->_stream = stream.release();
-              tinfo->_cvar.notify_one();
-            }
-          }
+        ServerThreadInfo *tinfo = dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
+        if (nullptr == tinfo) {
+          std::cerr << "Failed to get worker thread\n";
         } else {
-          std::cerr << errata;
+          // Only pointer to worker thread info.
+          {
+            std::unique_lock<std::mutex> lock(tinfo->_mutex);
+            tinfo->_stream = stream.release();
+            tinfo->_cvar.notify_one();
+          }
         }
       } else {
         std::cerr << errata;

@@ -80,7 +80,7 @@ extern bool Verbose;
 class Stream {
 public:
   Stream();
-  ~Stream();
+  virtual ~Stream();
 
   int fd() const;
   virtual ssize_t read(swoc::MemSpan<char> span);
@@ -104,6 +104,7 @@ public:
   using super = Stream;
   virtual ssize_t read(swoc::MemSpan<char> span) override;
   virtual ssize_t write(swoc::TextView data) override;
+  ~TLSStream() override { if (_ssl) SSL_free(_ssl); }
 
   void close() override;
   swoc::Errata accept() override;
@@ -406,11 +407,13 @@ public:
   void wait_for_work(ThreadInfo *info);
   ThreadInfo *get_worker();
   virtual std::thread make_thread(std::thread *) = 0;
+  void join_threads();
 protected:
   std::list<std::thread> _allThreads;
   // Pool of ready / idle threads.
   std::deque<ThreadInfo *> _threadPool;
   std::condition_variable _threadPoolCvar;
   std::mutex _threadPoolMutex;
+  const int max_threads = 100;
 };
 
