@@ -9,6 +9,7 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/time.h>
+#include <assert.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -63,11 +64,13 @@ class ClientReplayFileHandler : public ReplayFileHandler {
   Txn _txn;
 };
 
+bool Shutdown_Flag = false;
+
 class ClientThreadInfo : public ThreadInfo {
 public:
   Ssn *_ssn = nullptr;
   bool data_ready() override {
-    return this->_ssn;
+    return Shutdown_Flag ? true : this->_ssn != nullptr;
   }
 };
 
@@ -77,8 +80,6 @@ public:
 };
 
 ClientThreadPool Client_Thread_Pool;
-
-bool Shutdown_Flag = false;
 
 void TF_Client(std::thread *t);
 
@@ -224,22 +225,32 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
 swoc::Errata do_connect(Stream *stream, const swoc::IPEndpoint *real_target) {
   swoc::Errata errata;
   int socket_fd = socket(real_target->family(), SOCK_STREAM, 0);
-  if (0 <= socket_fd) { 
-    errata = stream->open(socket_fd);
-    if (errata.is_ok()) {
-      if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
-        static const int ONE = 1;
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-        errata = stream->connect();
-      } else {
-        errata.error(R"(Failed to connect socket - {})", swoc::bwf::Errno{});
-      }
-    }
-    else {
-      errata.error(R"(Failed to open stream - {})", swoc::bwf::Errno{});
-    }  
+  int ONE = 1;
+  struct linger l;
+  l.l_onoff  = 0;
+  l.l_linger = 0;
+  setsockopt(socket_fd, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof(l));
+  if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+    errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
+                     swoc::bwf::Errno{});
   } else {
-    errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+    if (0 <= socket_fd) { 
+      errata = stream->open(socket_fd);
+      if (errata.is_ok()) {
+        if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
+          static const int ONE = 1;
+          setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
+          errata = stream->connect();
+        } else {
+          errata.error(R"(Failed to connect socket - {})", swoc::bwf::Errno{});
+        }
+      }
+      else {
+        errata.error(R"(Failed to open stream - {})", swoc::bwf::Errno{});
+      }  
+    } else {
+      errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+    }
   }
   return errata;
 }
@@ -289,10 +300,10 @@ void TF_Client(std::thread *t) {
     Client_Thread_Pool.wait_for_work(&info);
 
     if (info._ssn != nullptr) {
-        swoc::Errata result = Run_Session(*info._ssn, Target, Target_Https);
-        if (!result.is_ok()) {
-          std::cerr << result;
-        }
+      swoc::Errata result = Run_Session(*info._ssn, Target, Target_Https);
+      if (!result.is_ok()) {
+        std::cerr << result;
+      }
     }
   }  
 }
@@ -323,9 +334,8 @@ struct Engine {
 };
 
 uint64_t GetUTimestamp() {
-  struct timeval tv;
-  gettimeofday(&tv, nullptr);
-  return tv.tv_sec*1000000 + tv.tv_usec;
+  auto retval =  std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch());
+  return retval.count();
 }
 
 void Engine::command_run() {
@@ -363,7 +373,7 @@ void Engine::command_run() {
                               return Load_Replay_File(file, handler);
                             },
                             10);
-  if (!result.is_ok()) {
+  if (!result.is_ok() && result.severity() != swoc::Severity::ERROR) {
     return;
   }
 
@@ -396,47 +406,59 @@ void Engine::command_run() {
 
   float rate_multiplier = 0.0;
   auto rate_arg{arguments.get("rate")};
+  auto repeat_arg{arguments.get("repeat")};
+  auto sleep_limit_arg{arguments.get("sleep-limit")};
+  int repeat_count;
+  uint64_t sleep_limit = 500000;
   if (rate_arg.size() == 1 && !Session_List.empty()) {
     int target = atoi(rate_arg[0].c_str());
-    rate_multiplier = (transaction_count * 1000000000.0)/(target*Session_List.back()->_start);
+    if (target == 0.0) {
+      rate_multiplier = 0.0;
+    } else {
+      rate_multiplier = (transaction_count * 1000000.0)/(target*Session_List.back()->_start);
+    }
   }
   std::cout << "Rate multiplier is " << rate_multiplier << " Transaction count is " << transaction_count << " Time delta " << Session_List.back()->_start << " first time " << offset_time << "\n";
+
+  if (repeat_arg.size() == 1) {
+    repeat_count = atoi(repeat_arg[0].c_str())*1000;
+  } else {
+    repeat_count = 1;
+  }
+
+  if (sleep_limit_arg.size() == 1) {
+    sleep_limit = atoi(sleep_limit_arg[0].c_str());
+  }
 
   auto start = std::chrono::high_resolution_clock::now();
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
-  uint64_t lasttime = GetUTimestamp();
-  for (auto *ssn : Session_List) {
-    uint64_t curtime = GetUTimestamp();
-    uint64_t nexttime = rate_multiplier * ssn->_start + lasttime;
-    if (nexttime > curtime) {
-      //std::cout << "Sleep " << nexttime - curtime << " ms " << nexttime << " " << curtime << "\n";
-      //usleep(nexttime - curtime);
-    }
-    lasttime = GetUTimestamp();
-    ClientThreadInfo *tinfo = dynamic_cast<ClientThreadInfo *>(Client_Thread_Pool.get_worker());
-    if (nullptr == tinfo) {
-      std::cerr << "Failed to get worker thread\n";
-    } else {
-      // Only pointer to worker thread info.
-      {
-        std::unique_lock<std::mutex> lock(tinfo->_mutex);
-        tinfo->_ssn = ssn;
-        tinfo->_cvar.notify_one();
+  uint64_t firsttime = GetUTimestamp();
+  for (int i = 0; i < repeat_count; i++) {
+    uint64_t lasttime = GetUTimestamp();
+    uint64_t nexttime;
+    for (auto *ssn : Session_List) {
+      uint64_t curtime = GetUTimestamp();
+      nexttime = (uint64_t)(rate_multiplier * ssn->_start) + firsttime;
+      if (nexttime > curtime) {
+        //std::cout << "Sleep " << nexttime - curtime << " ms " << nexttime << " " << curtime << " " << (uint64_t)(rate_multiplier*ssn->_start) + lasttime << "\n";
+        usleep(std::min(sleep_limit, nexttime - curtime));
       }
-    }    
-/*
-    result = Run_Session(*ssn, target, target_https);
-    if (!result.is_ok()) {
-      std::cerr << result;
-      break;
+      lasttime = GetUTimestamp();
+      ClientThreadInfo *tinfo = dynamic_cast<ClientThreadInfo *>(Client_Thread_Pool.get_worker());
+      if (nullptr == tinfo) {
+        std::cerr << "Failed to get worker thread\n";
+      } else {
+        // Only pointer to worker thread info.
+        {
+          std::unique_lock<std::mutex> lock(tinfo->_mutex);
+          tinfo->_ssn = ssn;
+          tinfo->_cvar.notify_one();
+        }
+      }    
+      ++n_ssn;
+      n_txn += ssn->_txn.size();
     }
-    if (result.count() && Verbose) {
-      std::cout << result;
-    }
-*/
-    ++n_ssn;
-    n_txn += ssn->_txn.size();
   }
   // Wait until all threads are done
   Shutdown_Flag = true;
@@ -462,7 +484,10 @@ int main(int argc, const char *argv[]) {
                    "", MORE_THAN_ONE_ARG_N,
                    [&]() -> void { engine.command_run(); })
       .add_option("--no-proxy", "", "Use proxy data instead of client data.")
+      .add_option("--repeat", "", "Repeatedly replay data set", "", 1, "")
+      .add_option("--sleep-limit", "", "Limit the amount of time spent sleeping between replays (ms)", "", 1, "")
       .add_option("--rate", "", "Specify desired transacton rate", "", 1, "");
+
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);

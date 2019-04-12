@@ -349,7 +349,7 @@ void Engine::command_run() {
                             },
                             10);
 
-  if (!errata.is_ok()) {
+  if (!errata.is_ok() && errata.severity() != swoc::Severity::ERROR) {
     return;
   }
   if (errata.count()) {

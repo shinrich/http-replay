@@ -764,7 +764,7 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
       try {
         root = YAML::Load(content);
       } catch (std::exception const &ex) {
-        errata.error(R"(Exception: {} in "{}".)", ex.what(), path);
+        errata.warn(R"(Exception: {} in "{}".)", ex.what(), path);
       }
       if (errata.is_ok()) {
         if (root[YAML_SSN_KEY]) {
@@ -944,6 +944,8 @@ swoc::Rv<swoc::IPEndpoint> Resolve_FQDN(swoc::TextView fqdn) {
   return std::move(zret);
 }
 
+using namespace std::chrono_literals;
+
 void ThreadPool::wait_for_work(ThreadInfo *info) 
 {
   // ready to roll, add to the pool.
@@ -956,8 +958,9 @@ void ThreadPool::wait_for_work(ThreadInfo *info)
   // wait for a notification there's a stream to process.
   {
     std::unique_lock<std::mutex> lock(info->_mutex);
-    while (!info->data_ready()) {
-      info->_cvar.wait(lock);
+    bool condition_awoke = false;
+    while (!info->data_ready() && !condition_awoke) {
+      info->_cvar.wait_for(lock, 100ms);
     }
   }
 }
@@ -991,13 +994,7 @@ ThreadInfo *ThreadPool::get_worker() {
 }
 
 void ThreadPool::join_threads() {
-  std::unique_lock<std::mutex> lock(_threadPoolMutex);
-  for (auto info: _threadPool) {
-    info->_cvar.notify_one();
-  }
-  while (!_allThreads.empty()) {
-    std::thread *thread = &_allThreads.front();
-    thread->join();
-    _allThreads.pop_front();
+  for (auto &thread: _allThreads) {
+    thread.join();
   }
 }
