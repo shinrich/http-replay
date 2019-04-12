@@ -8,6 +8,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <libgen.h>
 
 #include <bits/signum.h>
 #include <dirent.h>
@@ -16,6 +17,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "core/ArgParser.h"
 #include "core/HttpReplay.h"
@@ -32,7 +34,7 @@
 
 using swoc::BufferWriter;
 using swoc::TextView;
-
+/*
 struct ThreadInfo {
   std::thread *_thread = nullptr;
   std::condition_variable _cvar;
@@ -46,6 +48,29 @@ std::list<std::thread> All_Threads;
 std::deque<ThreadInfo *> Thread_Pool;
 std::condition_variable Thread_Pool_CVar;
 std::mutex Thread_Pool_Mutex;
+*/
+std::list<std::thread *> Listen_threads;
+
+void TF_Serve(std::thread *t);
+
+class ServerThreadInfo : public ThreadInfo {
+public:
+  Stream *_stream = nullptr;
+  bool data_ready() override {
+    return this->_stream;
+  }
+};
+
+class ServerThreadPool : public ThreadPool {
+public:
+  std::thread make_thread(std::thread *t) override;
+};
+
+ServerThreadPool Server_Thread_Pool;
+
+std::thread ServerThreadPool::make_thread(std::thread *t) {
+  return std::thread(TF_Serve, t); // move the temporary into the list element for permanence.
+}
 
 /** Command execution.
  *
@@ -136,26 +161,14 @@ swoc::Errata ServerReplayFileHandler::txn_close() {
 }
 
 void TF_Serve(std::thread *t) {
-  ThreadInfo info;
+  ServerThreadInfo info;
   info._thread = t;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
 
-    // ready to roll, add to the pool.
-    {
-      std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
-      Thread_Pool.push_back(&info);
-      Thread_Pool_CVar.notify_all();
-    }
+    Server_Thread_Pool.wait_for_work(&info);
 
-    // wait for a notification there's a stream to process.
-    {
-      std::unique_lock<std::mutex> lock(info._mutex);
-      while (!info._stream) {
-        info._cvar.wait(lock);
-      }
-    }
-
+    errata = info._stream->accept();
     while (!info._stream->is_closed() && errata.is_ok()) {
       HttpHeader req_hdr;
       swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
@@ -209,46 +222,35 @@ void TF_Serve(std::thread *t) {
   }
 }
 
-void TF_Accept(int socket_fd) {
+void TF_Accept(int socket_fd, bool do_tls) {
   std::unique_ptr<Stream> stream;
   while (!Shutdown_Flag) {
     swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
     socklen_t remote_addr_size;
     int fd =
-        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, SOCK_NONBLOCK);
+        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
     if (fd >= 0) {
-      stream.reset(new Stream);
+      if (do_tls) {
+        stream.reset(new TLSStream);
+      } else {
+        stream.reset(new Stream);
+      }
       errata = stream->open(fd);
       if (errata.is_ok()) {
         static const int ONE = 1;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
-        ThreadInfo *tinfo = nullptr;
-        {
-          std::unique_lock<std::mutex> lock(Thread_Pool_Mutex);
-          while (Thread_Pool.size() == 0) {
-            // Some ugly stuff so that the thread can put a pointer to it's @c
-            // std::thread in it's info. Circular dependency - there's no object
-            // until after the constructor is called but the constructor needs
-            // to be called to get the object. Sigh.
-            All_Threads.emplace_back();
-            // really? I have to do this to get an iterator / pointer to the
-            // element I just added?
-            std::thread *t = &*(std::prev(All_Threads.end()));
-            *t = std::thread(
-                TF_Serve,
-                t); // move the temporary into the list element for permanence.
-            Thread_Pool_CVar.wait(lock); // expect the new thread to enter
-                                         // itself in the pool and signal.
+
+        ServerThreadInfo *tinfo = dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
+        if (nullptr == tinfo) {
+          std::cerr << "Failed to get worker thread\n";
+        } else {
+          // Only pointer to worker thread info.
+          {
+            std::unique_lock<std::mutex> lock(tinfo->_mutex);
+            tinfo->_stream = stream.release();
+            tinfo->_cvar.notify_one();
           }
-          tinfo = Thread_Pool.front();
-          Thread_Pool.pop_front();
-        }
-        // Only pointer to worker thread info.
-        {
-          std::unique_lock<std::mutex> lock(tinfo->_mutex);
-          tinfo->_stream = stream.release();
-          tinfo->_cvar.notify_one();
         }
       } else {
         std::cerr << errata;
@@ -257,10 +259,48 @@ void TF_Accept(int socket_fd) {
   }
 }
 
+swoc::Errata
+do_listen(swoc::IPEndpoint &server_addr, bool do_tls) 
+{
+  swoc::Errata errata;
+  int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
+  if (socket_fd >= 0) {
+    // Be agressive in reusing the port
+    int ONE = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+      errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
+                       swoc::bwf::Errno{});
+    } else {
+      int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
+      if (bind_result == 0) {
+        int listen_result = listen(socket_fd, 1);
+        if (listen_result == 0) {
+          Info(R"(Listening at {})", server_addr);
+          std::thread *runner = new std::thread{TF_Accept, socket_fd, do_tls};
+          Listen_threads.push_back(runner);
+        } else {
+          errata.error(R"(Could not isten to {} - {}.)", server_addr,
+                       swoc::bwf::Errno{});
+        }
+      } else {
+        errata.error(R"(Could not bind to {} - {}.)", server_addr,
+                     swoc::bwf::Errno{});
+      }
+    }
+  } else {
+    errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
+  }
+  if (!errata.is_ok() && socket_fd >= 0) {
+    close(socket_fd);
+  }
+  return errata;
+}
+
 void Engine::command_run() {
   auto args{arguments.get("run")};
-  swoc::IPEndpoint server_addr;
+  swoc::IPEndpoint server_addr, server_addr_https;
   auto server_addr_arg{arguments.get("listen")};
+  auto server_addr_https_arg{arguments.get("listen-https")};
   swoc::LocalBufferWriter<1024> w;
 
   if (args.size() < 1) {
@@ -280,6 +320,23 @@ void Engine::command_run() {
     }
   }
 
+  if (server_addr_https_arg) {
+    if (server_addr_https_arg.size() == 1) {
+      if (!server_addr_https.parse(server_addr_https_arg[0])) {
+        errata.error(R"("{}" is not a valid IP address.)", server_addr_https_arg);
+        return;
+      }
+    } else {
+      errata.error(
+          R"(--listen-https option must have a single value, the listen address and port.)");
+    }
+  }
+
+  if (!server_addr.is_valid() && !server_addr_https.is_valid()) {
+    errata.error(
+        R"(Must specify a http or https listen port via --listen or --listen-https)");
+  }
+
   if (!errata.is_ok()) {
     return;
   }
@@ -292,7 +349,7 @@ void Engine::command_run() {
                             },
                             10);
 
-  if (!errata.is_ok()) {
+  if (!errata.is_ok() && errata.severity() != swoc::Severity::ERROR) {
     return;
   }
   if (errata.count()) {
@@ -314,28 +371,19 @@ void Engine::command_run() {
   std::cout << "Ready" << std::endl;
 
   // Set up listen port.
-  int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
-  if (socket_fd >= 0) {
-    int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
-    if (bind_result == 0) {
-      int listen_result = listen(socket_fd, 1);
-      if (listen_result == 0) {
-        Info(R"(Listening at {})", server_addr);
-        std::thread runner{TF_Accept, socket_fd};
-        runner.join();
-      } else {
-        errata.error(R"(Could not listen to {} - {}.)", server_addr,
-                     swoc::bwf::Errno{});
-      }
-    } else {
-      errata.error(R"(Could not bind to {} - {}.)", server_addr,
-                   swoc::bwf::Errno{});
-    }
-  } else {
-    errata.error(R"(Could not create socket - {}.)", swoc::bwf::Errno{});
+  if (server_addr.is_valid()) {
+    errata = do_listen(server_addr, false);
   }
-  if (socket_fd >= 0) {
-    close(socket_fd);
+  if (!errata.is_ok()) {
+    return;
+  }
+  if (server_addr_https.is_valid()) {
+    errata = do_listen(server_addr_https, true);
+  }
+
+  // Don't exit until all the listen threads go away
+  while (true) {
+    sleep(10);
   }
 }
 
@@ -350,13 +398,26 @@ int main(int argc, const char *argv[]) {
       .add_command("run", "run <dir>: the replay server using data in <dir>",
                    "", 1, [&]() -> void { engine.command_run(); })
       .add_option("--listen", "", "Listen address and port", "", 1,
-                  "127.0.0.1:8080");
+                  "")
+      .add_option("--listen-https", "", "Listen TLS address and port", "", 1,
+                  "");
+  char certfile[PATH_MAX];
+  strncpy(certfile, argv[0], sizeof(certfile));
+  dirname(certfile);
+  strncat(certfile, "/../server.pem", sizeof(certfile));
+  TLSStream::certificate_file = certfile;
+  strncpy(certfile, argv[0], sizeof(certfile));
+  dirname(certfile);
+  strncat(certfile, "/../server.key", sizeof(certfile));
+  TLSStream::privatekey_file = certfile;
+  TLSStream::init();
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
   if (auto args{engine.arguments.get("verbose")}; args) {
     Verbose = true;
   }
+
 
   engine.arguments.invoke();
 

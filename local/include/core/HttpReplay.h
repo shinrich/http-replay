@@ -25,8 +25,11 @@
 #include <string>
 #include <unordered_set>
 
-#include <sys/epoll.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 
 #include "yaml-cpp/yaml.h"
 
@@ -77,24 +80,43 @@ extern bool Verbose;
 class Stream {
 public:
   Stream();
-  ~Stream();
+  virtual ~Stream();
 
   int fd() const;
-  ssize_t read(swoc::MemSpan<char> span);
-  ssize_t write(swoc::TextView data);
+  virtual ssize_t read(swoc::MemSpan<char> span);
+  virtual ssize_t write(swoc::TextView data);
+  virtual swoc::Errata accept();
+  virtual swoc::Errata connect();
 
-  swoc::Errata open(int fd);
+  virtual swoc::Errata open(int fd);
   bool is_closed() const;
-  void close();
+  virtual void close();
 
 protected:
-  int _fd = -1;                 ///< Socket.
-  int _poll_fd = -1;            ///< polling file descriptor.
-  epoll_event _epv{0, nullptr}; ///< Event object.
+  int _fd = -1;      ///< Socket.
 };
 
 inline int Stream::fd() const { return _fd; }
 inline bool Stream::is_closed() const { return _fd < 0; }
+
+class TLSStream : public Stream {
+public:
+  using super = Stream;
+  virtual ssize_t read(swoc::MemSpan<char> span) override;
+  virtual ssize_t write(swoc::TextView data) override;
+  ~TLSStream() override { if (_ssl) SSL_free(_ssl); }
+
+  void close() override;
+  swoc::Errata accept() override;
+  swoc::Errata connect() override;
+  static void init();
+  static std::string certificate_file;
+  static std::string privatekey_file;
+protected:
+  SSL *_ssl = nullptr;
+  static SSL_CTX *server_ctx;
+  static SSL_CTX *client_ctx;
+};
 
 class ChunkCodex {
 public:
@@ -370,3 +392,28 @@ template <typename... Args> void Info(swoc::TextView fmt, Args &&... args) {
     }
   }
 }
+
+class ThreadInfo {
+public:
+  std::thread *_thread = nullptr;
+  std::condition_variable _cvar;
+  std::mutex _mutex;
+  virtual bool data_ready() = 0;
+};
+
+// This must be a list so that iterators / pointers to elements do not go stale.
+class ThreadPool {
+public:
+  void wait_for_work(ThreadInfo *info);
+  ThreadInfo *get_worker();
+  virtual std::thread make_thread(std::thread *) = 0;
+  void join_threads();
+protected:
+  std::list<std::thread> _allThreads;
+  // Pool of ready / idle threads.
+  std::deque<ThreadInfo *> _threadPool;
+  std::condition_variable _threadPoolCvar;
+  std::mutex _threadPoolMutex;
+  const int max_threads = 100;
+};
+
