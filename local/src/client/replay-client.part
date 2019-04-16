@@ -9,9 +9,11 @@ env.DependsOn([
 ])
 
 env.AppendUnique(
-    CCFLAGS=['-std=c++17'],    
+    CCFLAGS=['-std=c++17'],
 )
 
 env.InstallBin(
-    env.Program("replay-client",["replay-client.cc"])
+    env.SetRPath(  # allow fancy patchelf runpath setting it defined
+        env.Program("replay-client", ["replay-client.cc"])
+    )
 )
