@@ -27,6 +27,7 @@
 #include "swoc/TextView.h"
 #include "swoc/bwf_base.h"
 #include "swoc/bwf_ex.h"
+#include "swoc/bwf_std.h"
 #include "swoc/bwf_ip.h"
 #include "swoc/swoc_file.h"
 #include "swoc/swoc_ip.h"
@@ -34,24 +35,14 @@
 
 using swoc::BufferWriter;
 using swoc::TextView;
-/*
-struct ThreadInfo {
-  std::thread *_thread = nullptr;
-  std::condition_variable _cvar;
-  std::mutex _mutex;
-  Stream *_stream = nullptr;
-};
-
-// This must be a list so that iterators / pointers to elements do not go stale.
-std::list<std::thread> All_Threads;
-// Pool of ready / idle threads.
-std::deque<ThreadInfo *> Thread_Pool;
-std::condition_variable Thread_Pool_CVar;
-std::mutex Thread_Pool_Mutex;
-*/
-std::list<std::thread *> Listen_threads;
 
 void TF_Serve(std::thread *t);
+
+// Path to the parent directory of the executable, used for relative paths.
+swoc::file::path ROOT_PATH;
+
+// This must be a list so that iterators / pointers to elements do not go stale.
+std::list<std::thread *> Listen_threads;
 
 class ServerThreadInfo : public ThreadInfo {
 public:
@@ -301,6 +292,8 @@ void Engine::command_run() {
   swoc::IPEndpoint server_addr, server_addr_https;
   auto server_addr_arg{arguments.get("listen")};
   auto server_addr_https_arg{arguments.get("listen-https")};
+  auto cert_arg{arguments.get("cert")};
+
   swoc::LocalBufferWriter<1024> w;
 
   if (args.size() < 1) {
@@ -325,6 +318,31 @@ void Engine::command_run() {
       if (!server_addr_https.parse(server_addr_https_arg[0])) {
         errata.error(R"("{}" is not a valid IP address.)", server_addr_https_arg);
         return;
+      }
+      std::error_code ec;
+
+      if (cert_arg.size() >= 1) {
+        swoc::file::path cert_path{cert_arg[0]};
+        if (!cert_path.is_absolute()) {
+          cert_path = ROOT_PATH / cert_path;
+        }
+        auto stat{swoc::file::status(cert_path, ec)};
+        if (ec.value() == 0) {
+          if (is_dir(stat)) {
+            TLSStream::certificate_file = cert_path / "server.pem";
+            TLSStream::privatekey_file = cert_path / "server.key";
+          } else {
+            TLSStream::certificate_file = cert_path;
+          }
+        } else {
+          errata.error(R"(Invalid certificate path "{}" - {}.)", cert_arg[0], ec);
+        }
+      } else {
+        TLSStream::certificate_file = ROOT_PATH / "server.pem";
+        TLSStream::privatekey_file = ROOT_PATH / "server.key";
+      }
+      if (errata.is_ok()) {
+        errata = TLSStream::init();
       }
     } else {
       errata.error(
@@ -400,17 +418,9 @@ int main(int argc, const char *argv[]) {
       .add_option("--listen", "", "Listen address and port", "", 1,
                   "")
       .add_option("--listen-https", "", "Listen TLS address and port", "", 1,
-                  "");
-  char certfile[PATH_MAX];
-  strncpy(certfile, argv[0], sizeof(certfile));
-  dirname(certfile);
-  strncat(certfile, "/../server.pem", sizeof(certfile));
-  TLSStream::certificate_file = certfile;
-  strncpy(certfile, argv[0], sizeof(certfile));
-  dirname(certfile);
-  strncat(certfile, "/../server.key", sizeof(certfile));
-  TLSStream::privatekey_file = certfile;
-  TLSStream::init();
+                  "")
+                  .add_option("--cert", "", "Specify certificate file", "", 1, "");
+
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);
@@ -418,6 +428,8 @@ int main(int argc, const char *argv[]) {
     Verbose = true;
   }
 
+  ROOT_PATH = argv[0];
+  ROOT_PATH = ROOT_PATH.parent_path();
 
   engine.arguments.invoke();
 

@@ -170,35 +170,37 @@ void TLSStream::close() {
   }
 }
 
-std::string TLSStream::certificate_file;
-std::string TLSStream::privatekey_file;
+swoc::file::path TLSStream::certificate_file;
+swoc::file::path TLSStream::privatekey_file;
 SSL_CTX * TLSStream::server_ctx = nullptr;
 SSL_CTX * TLSStream::client_ctx = nullptr;
 
-void TLSStream::init() {
+swoc::Errata TLSStream::init() {
+  swoc::Errata errata;
   SSL_load_error_strings();
   SSL_library_init();
 
   server_ctx = SSL_CTX_new(TLS_server_method());
   if (!TLSStream::certificate_file.empty()) {
     if (!SSL_CTX_use_certificate_file(server_ctx, TLSStream::certificate_file.c_str(), SSL_FILETYPE_PEM)) {
-      fprintf(stderr, "Failed to load cert from %s, %s\n", TLSStream::certificate_file.c_str(), ERR_lib_error_string(ERR_peek_last_error()));
+      errata.error(R"(Failed to load cert from "{}" - {}.)", TLSStream::certificate_file, ERR_lib_error_string(ERR_peek_last_error()));
     } else {
       if (!TLSStream::privatekey_file.empty()) {
         if (!SSL_CTX_use_PrivateKey_file(server_ctx, TLSStream::privatekey_file.c_str(), SSL_FILETYPE_PEM)) {
-          fprintf(stderr, "Failed to load private key from %s, %s\n", TLSStream::privatekey_file.c_str(), ERR_lib_error_string(ERR_peek_last_error()));
+          errata.error(R"(Failed to load private key from "{}" - {}.)", TLSStream::privatekey_file, ERR_lib_error_string(ERR_peek_last_error()));
         }
       } else {
         if (!SSL_CTX_use_PrivateKey_file(server_ctx, TLSStream::certificate_file.c_str(), SSL_FILETYPE_PEM)) {
-          fprintf(stderr, "Failed to load private key from %s, %s\n", TLSStream::certificate_file.c_str(), ERR_lib_error_string(ERR_peek_last_error()));
+          errata.error(R"(Failed to load private key from "{}" - {}.)", TLSStream::certificate_file, ERR_lib_error_string(ERR_peek_last_error()));
         }
       }
     }
   }
   client_ctx = SSL_CTX_new(TLS_client_method());
   if (!client_ctx) {
-    fprintf(stderr, "Failed to create client_ctx %s\n", ERR_lib_error_string(ERR_peek_last_error()));
+    errata.error(R"(Failed to create client_ctx - {}.)", ERR_lib_error_string(ERR_peek_last_error()));
   }
+  return errata;
 }
 
 ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,

@@ -4,9 +4,7 @@ project(lib-replay-core)
 set(CMAKE_CXX_STANDARD 17)
 include(GNUInstallDirs)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-
-set(OPENSSL_ROOT_DIR /opt/oath/openssl/1.1.1)
+#set(OPENSSL_ROOT_DIR /opt/oath/openssl/1.1.1)
 find_package(swoc++ CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
@@ -15,7 +13,7 @@ add_library(lib-replay-core STATIC
     HttpReplay.cc
 )
 
-target_include_directories(lib-replay-core PUBLIC /home/shinrich/openssl/include)
+target_include_directories(lib-replay-core PUBLIC)
 target_link_libraries(lib-replay-core PUBLIC swoc++::swoc++)
 #target_include_directories(lib-replay-core swoc::swoc)
 

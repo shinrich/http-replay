@@ -109,9 +109,9 @@ public:
   void close() override;
   swoc::Errata accept() override;
   swoc::Errata connect() override;
-  static void init();
-  static std::string certificate_file;
-  static std::string privatekey_file;
+  static swoc::Errata init();
+  static swoc::file::path certificate_file;
+  static swoc::file::path privatekey_file;
 protected:
   SSL *_ssl = nullptr;
   static SSL_CTX *server_ctx;
