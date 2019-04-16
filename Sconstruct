@@ -1,0 +1,17 @@
+from parts import *
+
+#enable smart linking
+SetOptionDefault("LINKFLAGS", ['-Wl,--copy-dt-needed-entries', '-Wl,--as-needed'])
+
+# mode = OPENSSL_USE_SYSTEM will have the part use the system version instead
+openssl_git=None
+if "OPENSSL_USE_SYSTEM" not in DefaultEnvironment()["mode"]:
+    openssl_git=VcsGit(server="github.com", repository="openssl/openssl", protocol="https", tag="OpenSSL_1_1_1b")
+
+Part(
+    "#lib/openssl.part",vcs_type=openssl_git    
+)
+Part("#lib/libyaml.part",vcs_type=VcsGit(server="github.com", repository="jbeder/yaml-cpp.git", tag="yaml-cpp-0.6.2"))
+Part("swoc++/swoc++.part",vcs_type=VcsGit(server="github.com", repository="SolidWallOfCode/libswoc", branch="replay"))
+Part("local/http-replay.part")
+

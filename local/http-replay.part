@@ -1,0 +1,7 @@
+Import("*")
+PartVersion("1.0.0")
+PartName("http-replay")
+
+env.Part("src/core/core.part")
+env.Part("src/client/replay-client.part")
+env.Part("src/server/replay-server.part")

@@ -1,0 +1,204 @@
+Import('*')
+PartName("openssl")
+
+if "OPENSSL_USE_SYSTEM" not in env["MODE"]:
+    PartVersion(
+        GitVersionFromTag(
+            "1.1.1.dev",
+            regex=r'\d+\_\d+\_\d+[a-z]',
+            converter=lambda ver, env: ver.replace("_", ".")
+        )
+    )
+
+    copied = env.CCopy(
+        # source=files,
+        source=env.Glob("$VCS_DIR/*"),
+        target="$BUILD_DIR",
+        copy_logic=CCopy.copy
+    )
+
+    env.Command(
+        ["Makefile.tmp"],
+        copied,
+        [
+            "cd ${TARGET.dir} ; ./Configure -DSSL_ALLOW_ADH enable-ec_nistp_64_gcc_128 "
+            "--prefix=${ABSPATH('#_makeinstall')}/${PART_NAME} "
+            "--openssldir=${ABSPATH('#_makeinstall')}/${PART_NAME} linux-x86_64 shared",
+            Copy("$TARGET", "${TARGET.base}")
+        ],
+        source_scanner=Scanner(function=lambda *lst, **kw: [])
+    )
+    # we do this extra make logic as the openssl build will update the make rules after it builds the libraries
+    # but only after it builds the lib and on the second pass when a make depend targetis called
+    # This causes SCons to rebuild. to prevent that we add an extra command to rename the orginal makefile to makefile.tmp
+    # during the generation, and the rename build and update the depends as a different step so Scons sees the signiture
+    # as unchanged and does not do a false rebuild.
+    env.Command(
+        ["Makefile"],
+        ["Makefile.tmp"],
+        [
+            Copy("$TARGET", "$SOURCE"),
+            'cd ${{SOURCE.dir}} ; make CCFLAGS="-g" CC=${{CC}} CXX=${{CXX}} $(-j{jobs}$) && make depend'.format(
+                jobs=env.GetOption('num_jobs')),
+        ]
+    )
+
+    out = env.Command(
+        [
+            #        env.File("crypto/buildinf.h"),
+            "#_makeinstall/${PART_NAME}/bin/c_rehash",
+            "#_makeinstall/${PART_NAME}/bin/openssl",
+            "#_makeinstall/${PART_NAME}/include/openssl/aes.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/asn1err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/asn1.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/asn1_mac.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/asn1t.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/asyncerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/async.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/bioerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/bio.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/blowfish.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/bnerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/bn.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/buffererr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/buffer.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/camellia.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cast.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cmac.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cmserr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cms.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/comperr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/comp.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/conf_api.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/conferr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/conf.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cryptoerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/crypto.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/cterr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ct.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/des.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/dherr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/dh.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/dsaerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/dsa.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/dtls1.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ebcdic.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ecdh.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ecdsa.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ecerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ec.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/engineerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/engine.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/e_os2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/evperr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/evp.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/hmac.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/idea.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/kdferr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/kdf.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/lhash.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/md2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/md4.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/md5.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/mdc2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/modes.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/objectserr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/objects.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/obj_mac.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ocsperr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ocsp.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/opensslconf.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/opensslv.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ossl_typ.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pem2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pemerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pem.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pkcs12err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pkcs12.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pkcs7err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/pkcs7.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rand_drbg.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/randerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rand.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rc2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rc4.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rc5.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ripemd.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rsaerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/rsa.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/safestack.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/seed.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/sha.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/srp.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/srtp.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ssl2.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ssl3.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/sslerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ssl.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/stack.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/storeerr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/store.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/symhacks.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/tls1.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/tserr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ts.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/txt_db.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/uierr.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/ui.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/whrlpool.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/x509err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/x509.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/x509v3err.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/x509v3.h",
+            "#_makeinstall/${PART_NAME}/include/openssl/x509_vfy.h",
+            "#_makeinstall/${PART_NAME}/lib/engines-1.1/afalg.so",
+            "#_makeinstall/${PART_NAME}/lib/engines-1.1/capi.so",
+            "#_makeinstall/${PART_NAME}/lib/engines-1.1/padlock.so",
+            env.FileSymbolicLink("#_makeinstall/${PART_NAME}/lib/libssl.so"),
+            "#_makeinstall/${PART_NAME}/lib/libssl.so.1.1",
+            "#_makeinstall/${PART_NAME}/lib/pkgconfig/libcrypto.pc",
+            "#_makeinstall/${PART_NAME}/lib/pkgconfig/libssl.pc",
+            env.FileSymbolicLink(
+                "#_makeinstall/${PART_NAME}/lib/libcrypto.so"),
+            "#_makeinstall/${PART_NAME}/lib/libcrypto.so.1.1",
+            "#_makeinstall/${PART_NAME}/lib/pkgconfig/openssl.pc",
+        ],
+        ["Makefile"],
+        [
+            'cd ${{SOURCE.dir}} ; make install CC=${{CC}} CXX=${{CXX}} $(-j{jobs}$)'.format(
+                jobs=env.GetOption('num_jobs')),
+            #'cd ${SOURCE.dir} ; make install'
+        ]
+    )
+
+    env.InstallBin(
+        env.SetRPath(
+            env.Glob("#_makeinstall/${PART_NAME}/bin/*")
+        )
+    )
+
+    # env.InstallLib(env.Glob("#_makeinstall/${PART_NAME}/lib/*.a"), auto_add_libs=False)
+    env.InstallLib(
+        env.SetRPath(
+            env.Glob("#_makeinstall/${PART_NAME}/lib/*.so*")
+        )
+    )
+    env.InstallLib(env.Glob(
+        "#_makeinstall/${PART_NAME}/libengines-1.1/*.so"), auto_add_libs=False, sub_dir="libengines-1.1")
+    env.InstallInclude(  # bug we need to fix -JK
+        env.Glob("#_makeinstall/${PART_NAME}/include/openssl/*"),
+        add_to_path=False,
+        sub_dir="openssl"
+    )
+    env.InstallLib(env.Glob("#_makeinstall/${PART_NAME}/lib/pkgconfig/*.pc"),
+                   auto_add_libs=False, sub_dir="pkgconfig", add_to_path=False)
+
+    env.ExportItem("PKGCONFIG", env.Dir(
+        "#_makeinstall/${PART_NAME}/lib/pkgconfig").abspath)
+    env.ExportItem("SDK", env.Dir("#_makeinstall/${PART_NAME}").abspath)
+
+else:
+    # use system version
+    PartVersion("$VERSION")
+    env.ExportLIBS(["libssl", "libcrypto"])

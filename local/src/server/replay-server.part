@@ -1,0 +1,17 @@
+Import("*")
+PartName("replay-server")
+
+env.DependsOn([
+    Component("swoc++"),
+    Component("openssl"),
+    Component("yaml-cpp"),
+    Component("http-replay.core"),
+])
+
+env.AppendUnique(
+    CCFLAGS=['-std=c++17'],    
+)
+
+env.InstallBin(
+    env.Program("replay-server",["replay-server.cc"])
+)
