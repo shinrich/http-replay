@@ -4,20 +4,20 @@
 #include <csignal>
 #include <cstring>
 #include <deque>
+#include <libgen.h>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <libgen.h>
 
 #include <bits/signum.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 #include "core/ArgParser.h"
 #include "core/HttpReplay.h"
@@ -27,8 +27,8 @@
 #include "swoc/TextView.h"
 #include "swoc/bwf_base.h"
 #include "swoc/bwf_ex.h"
-#include "swoc/bwf_std.h"
 #include "swoc/bwf_ip.h"
+#include "swoc/bwf_std.h"
 #include "swoc/swoc_file.h"
 #include "swoc/swoc_ip.h"
 #include "yaml-cpp/yaml.h"
@@ -47,9 +47,7 @@ std::list<std::thread *> Listen_threads;
 class ServerThreadInfo : public ThreadInfo {
 public:
   Stream *_stream = nullptr;
-  bool data_ready() override {
-    return this->_stream;
-  }
+  bool data_ready() override { return this->_stream; }
 };
 
 class ServerThreadPool : public ThreadPool {
@@ -60,7 +58,8 @@ public:
 ServerThreadPool Server_Thread_Pool;
 
 std::thread ServerThreadPool::make_thread(std::thread *t) {
-  return std::thread(TF_Serve, t); // move the temporary into the list element for permanence.
+  return std::thread(
+      TF_Serve, t); // move the temporary into the list element for permanence.
 }
 
 /** Command execution.
@@ -219,8 +218,7 @@ void TF_Accept(int socket_fd, bool do_tls) {
     swoc::Errata errata;
     swoc::IPEndpoint remote_addr;
     socklen_t remote_addr_size;
-    int fd =
-        accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
+    int fd = accept4(socket_fd, &remote_addr.sa, &remote_addr_size, 0);
     if (fd >= 0) {
       if (do_tls) {
         stream.reset(new TLSStream);
@@ -232,7 +230,8 @@ void TF_Accept(int socket_fd, bool do_tls) {
         static const int ONE = 1;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &ONE, sizeof(ONE));
 
-        ServerThreadInfo *tinfo = dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
+        ServerThreadInfo *tinfo =
+            dynamic_cast<ServerThreadInfo *>(Server_Thread_Pool.get_worker());
         if (nullptr == tinfo) {
           std::cerr << "Failed to get worker thread\n";
         } else {
@@ -250,17 +249,16 @@ void TF_Accept(int socket_fd, bool do_tls) {
   }
 }
 
-swoc::Errata
-do_listen(swoc::IPEndpoint &server_addr, bool do_tls) 
-{
+swoc::Errata do_listen(swoc::IPEndpoint &server_addr, bool do_tls) {
   swoc::Errata errata;
   int socket_fd = socket(server_addr.family(), SOCK_STREAM, 0);
   if (socket_fd >= 0) {
     // Be agressive in reusing the port
     int ONE = 1;
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) <
+        0) {
       errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
-                       swoc::bwf::Errno{});
+                   swoc::bwf::Errno{});
     } else {
       int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
       if (bind_result == 0) {
@@ -316,7 +314,8 @@ void Engine::command_run() {
   if (server_addr_https_arg) {
     if (server_addr_https_arg.size() == 1) {
       if (!server_addr_https.parse(server_addr_https_arg[0])) {
-        errata.error(R"("{}" is not a valid IP address.)", server_addr_https_arg);
+        errata.error(R"("{}" is not a valid IP address.)",
+                     server_addr_https_arg);
         return;
       }
       std::error_code ec;
@@ -335,7 +334,8 @@ void Engine::command_run() {
             TLSStream::certificate_file = cert_path;
           }
         } else {
-          errata.error(R"(Invalid certificate path "{}" - {}.)", cert_arg[0], ec);
+          errata.error(R"(Invalid certificate path "{}" - {}.)", cert_arg[0],
+                       ec);
         }
       } else {
         TLSStream::certificate_file = ROOT_PATH / "server.pem";
@@ -415,12 +415,10 @@ int main(int argc, const char *argv[]) {
   engine.parser
       .add_command("run", "run <dir>: the replay server using data in <dir>",
                    "", 1, [&]() -> void { engine.command_run(); })
-      .add_option("--listen", "", "Listen address and port", "", 1,
-                  "")
+      .add_option("--listen", "", "Listen address and port", "", 1, "")
       .add_option("--listen-https", "", "Listen TLS address and port", "", 1,
                   "")
-                  .add_option("--cert", "", "Specify certificate file", "", 1, "");
-
+      .add_option("--cert", "", "Specify certificate file", "", 1, "");
 
   // parse the arguments
   engine.arguments = engine.parser.parse(argv);

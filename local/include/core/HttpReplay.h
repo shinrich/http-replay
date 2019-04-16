@@ -25,11 +25,11 @@
 #include <string>
 #include <unordered_set>
 
-#include <unistd.h>
-#include <openssl/ssl.h>
-#include <thread>
 #include <condition_variable>
 #include <deque>
+#include <openssl/ssl.h>
+#include <thread>
+#include <unistd.h>
 
 #include "yaml-cpp/yaml.h"
 
@@ -93,7 +93,7 @@ public:
   virtual void close();
 
 protected:
-  int _fd = -1;      ///< Socket.
+  int _fd = -1; ///< Socket.
 };
 
 inline int Stream::fd() const { return _fd; }
@@ -104,7 +104,10 @@ public:
   using super = Stream;
   virtual ssize_t read(swoc::MemSpan<char> span) override;
   virtual ssize_t write(swoc::TextView data) override;
-  ~TLSStream() override { if (_ssl) SSL_free(_ssl); }
+  ~TLSStream() override {
+    if (_ssl)
+      SSL_free(_ssl);
+  }
 
   void close() override;
   swoc::Errata accept() override;
@@ -112,6 +115,7 @@ public:
   static swoc::Errata init();
   static swoc::file::path certificate_file;
   static swoc::file::path privatekey_file;
+
 protected:
   SSL *_ssl = nullptr;
   static SSL_CTX *server_ctx;
@@ -174,6 +178,7 @@ protected:
 };
 
 class HttpHeader {
+  using self_type = HttpHeader;
   using Fields = std::unordered_map<swoc::TextView, std::string,
                                     std::hash<std::string_view>>;
   using TextView = swoc::TextView;
@@ -194,6 +199,11 @@ public:
 
   /// Mark which status codes have no content by default.
   static std::bitset<600> STATUS_NO_CONTENT;
+
+  HttpHeader() = default;
+  HttpHeader(self_type const &) = delete;
+  HttpHeader(self_type && that) = default;
+  self_type & operator=(self_type && that) = default;
 
   /** Read and parse a header.
    *
@@ -278,11 +288,11 @@ public:
   static void global_init();
 
 protected:
-  class Binding : public swoc::bwf::ContextNames<const HttpHeader> {
+  class Binding : public swoc::bwf::NameBinding {
     using BufferWriter = swoc::BufferWriter;
 
   public:
-  protected:
+    Binding(HttpHeader const &hdr) : _hdr(hdr) {}
     /** Override of virtual method to provide an implementation.
      *
      * @param w Output.
@@ -295,6 +305,9 @@ protected:
      */
     BufferWriter &operator()(BufferWriter &w,
                              const swoc::bwf::Spec &spec) const override;
+
+  protected:
+    HttpHeader const &_hdr;
   };
 
   /** Convert @a name to a localized view.
@@ -308,7 +321,6 @@ protected:
    */
   static TextView localize(TextView text);
 
-  static Binding _binding;
   //  using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
   struct Hash {
     swoc::Hash64FNV1a::value_type operator()(TextView view) const {
@@ -408,6 +420,7 @@ public:
   ThreadInfo *get_worker();
   virtual std::thread make_thread(std::thread *) = 0;
   void join_threads();
+
 protected:
   std::list<std::thread> _allThreads;
   // Pool of ready / idle threads.
@@ -416,4 +429,3 @@ protected:
   std::mutex _threadPoolMutex;
   const int max_threads = 100;
 };
-

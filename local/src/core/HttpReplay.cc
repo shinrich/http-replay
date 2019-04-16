@@ -22,11 +22,11 @@
 
 #include "core/HttpReplay.h"
 
-#include <openssl/ssl.h>
-#include <openssl/bio.h>
-#include <openssl/err.h>
 #include <dirent.h>
 #include <netdb.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <unistd.h>
 
 #include <thread>
@@ -39,7 +39,6 @@ bool Verbose = false;
 bool HttpHeader::_frozen = false;
 swoc::MemArena HttpHeader::_arena{8000};
 HttpHeader::NameSet HttpHeader::_names;
-HttpHeader::Binding HttpHeader::_binding;
 swoc::TextView HttpHeader::_key_format{"{field.uuid}"};
 swoc::MemSpan<char> HttpHeader::_content;
 swoc::TextView HttpHeader::FIELD_CONTENT_LENGTH;
@@ -53,12 +52,9 @@ namespace {
 }();
 }
 
-Stream::Stream() {
-}
+Stream::Stream() {}
 
-Stream::~Stream() {
-  this->close();
-}
+Stream::~Stream() { this->close(); }
 
 ssize_t Stream::read(swoc::MemSpan<char> span) {
   ssize_t n = ::read(_fd, span.data(), span.size());
@@ -76,14 +72,15 @@ ssize_t TLSStream::read(swoc::MemSpan<char> span) {
   ssl_error = (n <= 0) ? SSL_get_error(_ssl, n) : 0;
 
   if ((n < 0 && ssl_error != SSL_ERROR_WANT_READ)) {
-    fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n, SSL_get_error(_ssl, n), ERR_lib_error_string(ERR_peek_last_error()));
+    fprintf(stderr, "read failed: n=%d ssl_err=%d %s\n", n,
+            SSL_get_error(_ssl, n),
+            ERR_lib_error_string(ERR_peek_last_error()));
     this->close();
   } else if (n == 0) {
     this->close();
   }
   return n;
 }
-
 
 ssize_t Stream::write(swoc::TextView view) {
   return ::write(_fd, view.data(), view.size());
@@ -92,14 +89,16 @@ ssize_t Stream::write(swoc::TextView view) {
 ssize_t TLSStream::write(swoc::TextView view) {
   int total_size = view.size();
   int num_written = 0;
-  while (num_written < total_size) { 
-    int n = SSL_write(this->_ssl, view.data() + num_written, view.size() - num_written);
+  while (num_written < total_size) {
+    int n = SSL_write(this->_ssl, view.data() + num_written,
+                      view.size() - num_written);
     if (n <= 0) {
-      fprintf(stderr, "write failed: %s\n", ERR_lib_error_string(ERR_peek_last_error()));
+      fprintf(stderr, "write failed: %s\n",
+              ERR_lib_error_string(ERR_peek_last_error()));
       return n;
     } else {
       num_written += n;
-    } 
+    }
   }
   return num_written;
 }
@@ -120,12 +119,16 @@ swoc::Errata TLSStream::accept() {
   swoc::Errata errata;
   _ssl = SSL_new(server_ctx);
   if (_ssl == nullptr) {
-    errata.error(R"(Failed to create SSL server object fd={} server_ctx={} err={}.)", _fd, server_ctx, ERR_lib_error_string(ERR_peek_last_error()));
+    errata.error(
+        R"(Failed to create SSL server object fd={} server_ctx={} err={}.)",
+        _fd, server_ctx, ERR_lib_error_string(ERR_peek_last_error()));
   } else {
     SSL_set_fd(_ssl, _fd);
-    int retval = SSL_accept(_ssl);  
+    int retval = SSL_accept(_ssl);
     if (retval <= 0) {
-      errata.error(R"(Failed SSL_accept {} {} {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
+      errata.error(
+          R"(Failed SSL_accept {} {} {}.)", SSL_get_error(_ssl, retval),
+          ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
     }
   }
   return errata;
@@ -141,17 +144,20 @@ swoc::Errata TLSStream::connect() {
   swoc::Errata errata;
   _ssl = SSL_new(client_ctx);
   if (_ssl == nullptr) {
-    errata.error(R"(Failed to create SSL client object fd={} client_ctx={} err={}.)", _fd, client_ctx, ERR_lib_error_string(ERR_peek_last_error()));
+    errata.error(
+        R"(Failed to create SSL client object fd={} client_ctx={} err={}.)",
+        _fd, client_ctx, ERR_lib_error_string(ERR_peek_last_error()));
   } else {
     SSL_set_fd(_ssl, _fd);
-    int retval = SSL_connect(_ssl);  
+    int retval = SSL_connect(_ssl);
     if (retval <= 0) {
-      errata.error(R"(Failed SSL_connect {} {} {}.)", SSL_get_error(_ssl, retval), ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
+      errata.error(
+          R"(Failed SSL_connect {} {} {}.)", SSL_get_error(_ssl, retval),
+          ERR_lib_error_string(ERR_peek_last_error()), swoc::bwf::Errno{});
     }
   }
   return errata;
 }
-
 
 void Stream::close() {
   if (!this->is_closed()) {
@@ -172,8 +178,8 @@ void TLSStream::close() {
 
 swoc::file::path TLSStream::certificate_file;
 swoc::file::path TLSStream::privatekey_file;
-SSL_CTX * TLSStream::server_ctx = nullptr;
-SSL_CTX * TLSStream::client_ctx = nullptr;
+SSL_CTX *TLSStream::server_ctx = nullptr;
+SSL_CTX *TLSStream::client_ctx = nullptr;
 
 swoc::Errata TLSStream::init() {
   swoc::Errata errata;
@@ -182,23 +188,36 @@ swoc::Errata TLSStream::init() {
 
   server_ctx = SSL_CTX_new(TLS_server_method());
   if (!TLSStream::certificate_file.empty()) {
-    if (!SSL_CTX_use_certificate_file(server_ctx, TLSStream::certificate_file.c_str(), SSL_FILETYPE_PEM)) {
-      errata.error(R"(Failed to load cert from "{}" - {}.)", TLSStream::certificate_file, ERR_lib_error_string(ERR_peek_last_error()));
+    if (!SSL_CTX_use_certificate_file(server_ctx,
+                                      TLSStream::certificate_file.c_str(),
+                                      SSL_FILETYPE_PEM)) {
+      errata.error(R"(Failed to load cert from "{}" - {}.)",
+                   TLSStream::certificate_file,
+                   ERR_lib_error_string(ERR_peek_last_error()));
     } else {
       if (!TLSStream::privatekey_file.empty()) {
-        if (!SSL_CTX_use_PrivateKey_file(server_ctx, TLSStream::privatekey_file.c_str(), SSL_FILETYPE_PEM)) {
-          errata.error(R"(Failed to load private key from "{}" - {}.)", TLSStream::privatekey_file, ERR_lib_error_string(ERR_peek_last_error()));
+        if (!SSL_CTX_use_PrivateKey_file(server_ctx,
+                                         TLSStream::privatekey_file.c_str(),
+                                         SSL_FILETYPE_PEM)) {
+          errata.error(R"(Failed to load private key from "{}" - {}.)",
+                       TLSStream::privatekey_file,
+                       ERR_lib_error_string(ERR_peek_last_error()));
         }
       } else {
-        if (!SSL_CTX_use_PrivateKey_file(server_ctx, TLSStream::certificate_file.c_str(), SSL_FILETYPE_PEM)) {
-          errata.error(R"(Failed to load private key from "{}" - {}.)", TLSStream::certificate_file, ERR_lib_error_string(ERR_peek_last_error()));
+        if (!SSL_CTX_use_PrivateKey_file(server_ctx,
+                                         TLSStream::certificate_file.c_str(),
+                                         SSL_FILETYPE_PEM)) {
+          errata.error(R"(Failed to load private key from "{}" - {}.)",
+                       TLSStream::certificate_file,
+                       ERR_lib_error_string(ERR_peek_last_error()));
         }
       }
     }
   }
   client_ctx = SSL_CTX_new(TLS_client_method());
   if (!client_ctx) {
-    errata.error(R"(Failed to create client_ctx - {}.)", ERR_lib_error_string(ERR_peek_last_error()));
+    errata.error(R"(Failed to create client_ctx - {}.)",
+                 ERR_lib_error_string(ERR_peek_last_error()));
   }
   return errata;
 }
@@ -423,7 +442,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
   buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
 
   if (stream.is_closed()) {
-      errata.error(R"(drain_body: stream closed)");
+    errata.error(R"(drain_body: stream closed)");
   }
 
   if (_chunked_p) {
@@ -448,8 +467,8 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
           Info("Connection closed on unbounded body.");
         } else {
           errata.error(
-		      R"(Response underrun - recieved {} bytes of content, expected {}, when file closed because {}.)",
-		      body_size, content_length, swoc::bwf::Errno{});
+              R"(Response underrun - received {} bytes of content, expected {}, when file closed because {}.)",
+              body_size, content_length, swoc::bwf::Errno{});
         }
         break;
       }
@@ -470,7 +489,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
           Info("Connection close on unbounded body");
         } else {
           errata.error(
-              R"(Response underrun - recieved {} bytes  of content, expected {}, when file closed because {}.)",
+              R"(Response underrun - received {} bytes  of content, expected {}, when file closed because {}.)",
               body_size, content_length, swoc::bwf::Errno{});
         }
         break;
@@ -636,10 +655,10 @@ swoc::Errata HttpHeader::load(YAML::Node const &node) {
 std::string HttpHeader::make_key() {
   swoc::FixedBufferWriter w{nullptr};
   std::string key;
-  w.print_n(_binding.bind(*this), _key_format);
+  Binding binding(*this);
+  w.print_n(binding, _key_format);
   key.resize(w.extent());
-  swoc::FixedBufferWriter{key.data(), key.size()}.print_n(_binding.bind(*this),
-                                                          _key_format);
+  swoc::FixedBufferWriter{key.data(), key.size()}.print_n(binding, _key_format);
   return std::move(key);
 };
 
@@ -671,6 +690,7 @@ HttpHeader::parse_request(swoc::TextView data) {
       if (first_line.suffix(1)[0] == '\r') {
         first_line.remove_suffix(1);
       }
+      _method = this->localize(first_line.prefix_if(&isspace));
 
       while (data) {
         auto field{data.take_prefix_at('\n').rtrim_if(&isspace)};
@@ -741,7 +761,7 @@ operator()(BufferWriter &w, const swoc::bwf::Spec &spec) const {
   TextView name{spec._name};
   if (name.starts_with_nocase(FIELD_PREFIX)) {
     name.remove_prefix(FIELD_PREFIX.size());
-    if (auto spot{_ctx->_fields.find(name)}; spot != _ctx->_fields.end()) {
+    if (auto spot{_hdr._fields.find(name)}; spot != _hdr._fields.end()) {
       bwformat(w, spec, spot->second);
     } else {
       bwformat(w, spec, "*N/A*");
@@ -948,8 +968,7 @@ swoc::Rv<swoc::IPEndpoint> Resolve_FQDN(swoc::TextView fqdn) {
 
 using namespace std::chrono_literals;
 
-void ThreadPool::wait_for_work(ThreadInfo *info) 
-{
+void ThreadPool::wait_for_work(ThreadInfo *info) {
   // ready to roll, add to the pool.
   {
     std::unique_lock<std::mutex> lock(_threadPoolMutex);
@@ -974,7 +993,7 @@ ThreadInfo *ThreadPool::get_worker() {
     while (_threadPool.size() == 0) {
       if (_allThreads.size() > max_threads) {
         // Just sleep until a thread comes back
-        _threadPoolCvar.wait(lock); 
+        _threadPoolCvar.wait(lock);
       } else { // Make a new thread
         // Some ugly stuff so that the thread can put a pointer to it's @c
         // std::thread in it's info. Circular dependency - there's no object
@@ -996,7 +1015,7 @@ ThreadInfo *ThreadPool::get_worker() {
 }
 
 void ThreadPool::join_threads() {
-  for (auto &thread: _allThreads) {
+  for (auto &thread : _allThreads) {
     thread.join();
   }
 }
