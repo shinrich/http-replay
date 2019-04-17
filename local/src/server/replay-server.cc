@@ -422,7 +422,7 @@ int main(int argc, const char *argv[]) {
   }
 
   ROOT_PATH = argv[0];
-  ROOT_PATH = ROOT_PATH.parent_path();
+  ROOT_PATH = ROOT_PATH.parent_path().parent_path();
 
   engine.arguments.invoke();
 
