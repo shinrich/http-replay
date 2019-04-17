@@ -42,7 +42,7 @@ std::mutex LoadMutex;
 
 std::list<Ssn *> Session_List;
 
-swoc::IPEndpoint Target, Target_Https;
+std::deque<swoc::IPEndpoint> Target, Target_Https;
 
 bool Proxy_Mode = false;
 
@@ -225,16 +225,16 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
 swoc::Errata do_connect(Stream *stream, const swoc::IPEndpoint *real_target) {
   swoc::Errata errata;
   int socket_fd = socket(real_target->family(), SOCK_STREAM, 0);
-  int ONE = 1;
-  struct linger l;
-  l.l_onoff = 0;
-  l.l_linger = 0;
-  setsockopt(socket_fd, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof(l));
-  if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
-    errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
-                 swoc::bwf::Errno{});
-  } else {
-    if (0 <= socket_fd) {
+  if (0 <= socket_fd) { 
+    int ONE = 1;
+    struct linger l;
+    l.l_onoff  = 0;
+    l.l_linger = 0;
+    setsockopt(socket_fd, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof(l));
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(int)) < 0) {
+      errata.error(R"(Could not set reuseaddr on socket {} - {}.)", socket_fd,
+                     swoc::bwf::Errno{});
+    } else {
       errata = stream->open(socket_fd);
       if (errata.is_ok()) {
         if (0 == connect(socket_fd, &real_target->sa, real_target->size())) {
@@ -246,10 +246,10 @@ swoc::Errata do_connect(Stream *stream, const swoc::IPEndpoint *real_target) {
         }
       } else {
         errata.error(R"(Failed to open stream - {})", swoc::bwf::Errno{});
-      }
-    } else {
-      errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
+      }  
     }
+  } else {
+    errata.error(R"(Failed to open socket - {})", swoc::bwf::Errno{});
   }
   return errata;
 }
@@ -257,7 +257,6 @@ swoc::Errata do_connect(Stream *stream, const swoc::IPEndpoint *real_target) {
 swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target,
                          swoc::IPEndpoint const &target_https) {
   swoc::Errata errata;
-  int socket_fd = -2;
   std::unique_ptr<Stream> stream;
   const swoc::IPEndpoint *real_target;
 
@@ -285,25 +284,27 @@ swoc::Errata Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target,
       }
     }
   }
-  if (0 <= socket_fd) {
-    close(socket_fd);
-  }
   return std::move(errata);
 }
 
 void TF_Client(std::thread *t) {
   ClientThreadInfo info;
   info._thread = t;
+  int target_index = 0;
+  int target_https_index = 0;
+  
   while (!Shutdown_Flag) {
     swoc::Errata errata;
     info._ssn = nullptr;
     Client_Thread_Pool.wait_for_work(&info);
 
     if (info._ssn != nullptr) {
-      swoc::Errata result = Run_Session(*info._ssn, Target, Target_Https);
+      swoc::Errata result = Run_Session(*info._ssn, Target[target_index], Target_Https[target_https_index]);
       if (!result.is_ok()) {
         std::cerr << result;
       }
+      if (++target_index >= Target.size()) target_index = 0;
+      if (++target_https_index >= Target_Https.size()) target_https_index = 0;
     }
   }
 }
@@ -353,16 +354,14 @@ void Engine::command_run() {
     Proxy_Mode = true;
   }
 
-  auto &&[tmp_target, result_http] = Resolve_FQDN(args[1]);
-  if (!result_http.is_ok()) {
+  erratum =resolve_ips(args[1], Target);
+  if (!erratum.is_ok()) {
     return;
   }
-  Target = tmp_target;
-  auto &&[tmp_target_https, result_https] = Resolve_FQDN(args[2]);
-  if (!result_https.is_ok()) {
+  erratum =resolve_ips(args[2], Target_Https);
+  if (!erratum.is_ok()) {
     return;
   }
-  Target_Https = tmp_target_https;
 
   Info(R"(Loading directory "{}".)", args[0]);
   auto result =
@@ -423,7 +422,7 @@ void Engine::command_run() {
             << "\n";
 
   if (repeat_arg.size() == 1) {
-    repeat_count = atoi(repeat_arg[0].c_str()) * 1000;
+    repeat_count = atoi(repeat_arg[0].c_str());
   } else {
     repeat_count = 1;
   }
@@ -435,8 +434,8 @@ void Engine::command_run() {
   auto start = std::chrono::high_resolution_clock::now();
   unsigned n_ssn = 0;
   unsigned n_txn = 0;
-  uint64_t firsttime = GetUTimestamp();
   for (int i = 0; i < repeat_count; i++) {
+    uint64_t firsttime = GetUTimestamp();
     uint64_t lasttime = GetUTimestamp();
     uint64_t nexttime;
     for (auto *ssn : Session_List) {

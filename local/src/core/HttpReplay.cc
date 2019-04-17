@@ -443,6 +443,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
 
   if (stream.is_closed()) {
     errata.error(R"(drain_body: stream closed)");
+    return errata; 
   }
 
   if (_chunked_p) {
@@ -913,6 +914,44 @@ Load_Replay_Directory(swoc::file::path const &path,
     errata.error(R"(Failed to access directory "{}" - {}.)", path,
                  swoc::bwf::Errno{});
   }
+  return errata;
+}
+
+swoc::Errata parse_ips(std::string arg, std::deque<swoc::IPEndpoint> &target)
+{
+  swoc::Errata errata;
+  int offset = 0;
+  int new_offset;
+  while (offset != std::string::npos) {
+    new_offset = arg.find(',', offset);
+    std::string name = arg.substr(offset, new_offset - offset);
+    offset = new_offset != std::string::npos ? new_offset + 1 : new_offset;
+    swoc::IPEndpoint addr;
+    if (!addr.parse(name)) {
+      errata.error(R"("{}" is not a valid IP address.)", name);
+      return errata;
+    }
+    target.push_back(addr);
+  } 
+  return errata;
+}
+
+swoc::Errata resolve_ips(std::string arg, std::deque<swoc::IPEndpoint> &target)
+{
+  swoc::Errata errata;
+  int offset = 0;
+  int new_offset;
+  while (offset != std::string::npos) {
+    new_offset = arg.find(',', offset);
+    std::string name = arg.substr(offset, new_offset - offset);
+    offset = new_offset != std::string::npos ? new_offset + 1 : new_offset;
+    auto &&[tmp_target, result] = Resolve_FQDN(name);
+    if (!result.is_ok()) {
+      errata.error(R"("{}" is not a valid IP address.)", name);
+      return errata;
+    }
+    target.push_back(tmp_target);
+  } 
   return errata;
 }
 
