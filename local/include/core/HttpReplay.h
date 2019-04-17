@@ -368,6 +368,8 @@ Load_Replay_Directory(swoc::file::path const &path,
                       swoc::Errata (*loader)(swoc::file::path const &),
                       int n_threads = 10);
 
+swoc::Errata parse_ips(std::string arg, std::deque<swoc::IPEndpoint> &target);
+swoc::Errata resolve_ips(std::string arg, std::deque<swoc::IPEndpoint> &target);
 swoc::Rv<swoc::IPEndpoint> Resolve_FQDN(swoc::TextView host);
 
 namespace swoc {

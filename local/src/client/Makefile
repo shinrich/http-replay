@@ -1,7 +1,7 @@
 
 OBJ=replay-client.o ../core/ArgParser.o ../core/HttpReplay.o
 
-CXXFLAGS=-g -O2 -I/home/shinrich/openssl/include -I ../../include -I../../../include -std=c++17
+CXXFLAGS=-g -I/home/shinrich/openssl/include -I ../../include -I../../../include -std=c++17
 
 
 replay-client: ${OBJ}

@@ -262,7 +262,7 @@ swoc::Errata do_listen(swoc::IPEndpoint &server_addr, bool do_tls) {
     } else {
       int bind_result = bind(socket_fd, &server_addr.sa, server_addr.size());
       if (bind_result == 0) {
-        int listen_result = listen(socket_fd, 1);
+        int listen_result = listen(socket_fd, 16384);
         if (listen_result == 0) {
           Info(R"(Listening at {})", server_addr);
           std::thread *runner = new std::thread{TF_Accept, socket_fd, do_tls};
@@ -287,7 +287,7 @@ swoc::Errata do_listen(swoc::IPEndpoint &server_addr, bool do_tls) {
 
 void Engine::command_run() {
   auto args{arguments.get("run")};
-  swoc::IPEndpoint server_addr, server_addr_https;
+  std::deque<swoc::IPEndpoint> server_addrs, server_addrs_https;
   auto server_addr_arg{arguments.get("listen")};
   auto server_addr_https_arg{arguments.get("listen-https")};
   auto cert_arg{arguments.get("cert")};
@@ -298,13 +298,10 @@ void Engine::command_run() {
     errata.error(
         R"("run" command requires a directory path as an argument.)");
   }
-
+  
   if (server_addr_arg) {
     if (server_addr_arg.size() == 1) {
-      if (!server_addr.parse(server_addr_arg[0])) {
-        errata.error(R"("{}" is not a valid IP address.)", server_addr_arg);
-        return;
-      }
+      errata = parse_ips(server_addr_arg[0], server_addrs);
     } else {
       errata.error(
           R"(--listen option must have a single value, the listen address and port.)");
@@ -313,9 +310,8 @@ void Engine::command_run() {
 
   if (server_addr_https_arg) {
     if (server_addr_https_arg.size() == 1) {
-      if (!server_addr_https.parse(server_addr_https_arg[0])) {
-        errata.error(R"("{}" is not a valid IP address.)",
-                     server_addr_https_arg);
+      errata = parse_ips(server_addr_https_arg[0], server_addrs_https);
+      if (!errata.is_ok()) {
         return;
       }
       std::error_code ec;
@@ -349,12 +345,7 @@ void Engine::command_run() {
           R"(--listen-https option must have a single value, the listen address and port.)");
     }
   }
-
-  if (!server_addr.is_valid() && !server_addr_https.is_valid()) {
-    errata.error(
-        R"(Must specify a http or https listen port via --listen or --listen-https)");
-  }
-
+  
   if (!errata.is_ok()) {
     return;
   }
@@ -388,15 +379,19 @@ void Engine::command_run() {
 
   std::cout << "Ready" << std::endl;
 
-  // Set up listen port.
-  if (server_addr.is_valid()) {
-    errata = do_listen(server_addr, false);
+  for (auto &server_addr: server_addrs) {
+    // Set up listen port.
+    if (server_addr.is_valid()) {
+      errata = do_listen(server_addr, false);
+    }
+    if (!errata.is_ok()) {
+      return;
+    }
   }
-  if (!errata.is_ok()) {
-    return;
-  }
-  if (server_addr_https.is_valid()) {
-    errata = do_listen(server_addr_https, true);
+  for (auto &server_addr_https: server_addrs_https) {
+    if (server_addr_https.is_valid()) {
+      errata = do_listen(server_addr_https, true);
+    }
   }
 
   // Don't exit until all the listen threads go away
