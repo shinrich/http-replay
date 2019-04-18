@@ -314,6 +314,9 @@ void HttpHeader::global_init() {
 
   STATUS_NO_CONTENT[204] = true;
   STATUS_NO_CONTENT[304] = true;
+  for (auto code = 400; code < 600; code++) {
+    STATUS_NO_CONTENT[code] = true;
+  }
 }
 
 void HttpHeader::set_max_content_length(size_t n) {
