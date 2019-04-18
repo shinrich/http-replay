@@ -207,8 +207,26 @@ swoc::Errata Run_Transaction(Stream &stream, Txn const &txn) {
       ssize_t body_offset{read_result};
       auto result{rsp_hdr.parse_response(TextView(w.data(), body_offset))};
       if (result.is_ok()) {
+        if (rsp_hdr._status == 100) {
+          Info("100-Continue response. Read another header.");
+          rsp_hdr = HttpHeader{};
+          w.clear();
+          auto read_result{rsp_hdr.read_header(stream, w)};
+          if (read_result.is_ok()) {
+            body_offset = read_result;
+            auto result{rsp_hdr.parse_response(TextView(w.data(), body_offset))};
+            if (result.is_ok()) {
+            } else {
+              errata.error(R"(Failed to parse post 100 header.)");
+              return errata;
+            }
+          } else {
+            errata.error(R"(Failed to read post 100 header.)");
+            return errata;
+          }
+        } 
         Info("Reading response body.");
-        rsp_hdr.update_content_length();
+        rsp_hdr.update_content_length(txn._req._method);
         rsp_hdr.update_transfer_encoding();
         errata = rsp_hdr.drain_body(stream, w.view().substr(body_offset));
       } else {
@@ -322,9 +340,7 @@ struct Engine {
 
   static constexpr swoc::TextView COMMAND_RUN{"run"};
   static constexpr swoc::TextView COMMAND_RUN_ARGS{
-      "Arguments:\n\t<dir>: Directory containing replay files.\n\t<upstream>: "
-      "Upstream destination for http requests."
-      "Upstream destination for https requests."};
+      "Arguments:\n\t<dir>: Directory containing replay files.\n\t<upstream http>: hostname and port for http requests. Can be a comma seprated list\n\t<upstream https>: hostname and port for https requests.  Can be a comma separated list "};
   void command_run();
 
   /// Status code to return to the operating system.

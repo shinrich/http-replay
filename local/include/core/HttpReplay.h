@@ -173,6 +173,8 @@ protected:
     CR,   ///< Expecting the size terminating CR
     LF,   ///< Expecting the size terminating LF.
     BODY, ///< Inside the chunk body.
+    POST_BODY_CR,
+    POST_BODY_LF,
     FINAL ///< Terminating (size zero) chunk parsed.
   } _state = State::INIT;
 };
@@ -270,7 +272,7 @@ public:
   swoc::Rv<ParseResult> parse_request(TextView data);
   swoc::Rv<ParseResult> parse_response(TextView data);
 
-  swoc::Errata update_content_length();
+  swoc::Errata update_content_length(TextView method);
   swoc::Errata update_transfer_encoding();
 
   std::string make_key();
@@ -429,5 +431,5 @@ protected:
   std::deque<ThreadInfo *> _threadPool;
   std::condition_variable _threadPoolCvar;
   std::mutex _threadPoolMutex;
-  const int max_threads = 100;
+  const int max_threads = 2000;
 };

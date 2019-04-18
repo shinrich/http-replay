@@ -239,11 +239,27 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
         _state = State::CR;
         break;
       }
+    case State::POST_BODY_CR:
+      if (*data == '\r') {
+        _state = State::POST_BODY_LF;
+      }
+      ++data;
+      break;
     case State::CR:
       if (*data == '\r') {
         _state = State::LF;
       }
       ++data;
+      break;
+    case State::POST_BODY_LF:
+      if (*data == '\n') {
+        _state = State::SIZE;
+        ++data;
+        _off = 0;
+      } else {
+        _state = State::FINAL;
+        return DONE;
+      }
       break;
     case State::LF:
       if (*data == '\n') {
@@ -262,7 +278,7 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
       cb({data.data(), n}, _off, _size);
       data.remove_prefix(n);
       if ((_off += n) >= _size) {
-        _state = State::SIZE;
+        _state = State::POST_BODY_CR;
       }
     } break;
     case State::FINAL:
@@ -275,7 +291,7 @@ ChunkCodex::Result ChunkCodex::parse(swoc::TextView data,
 std::tuple<ssize_t, std::error_code>
 ChunkCodex::transmit(Stream &stream, swoc::TextView data, size_t chunk_size) {
   static const std::error_code NO_ERROR;
-  static constexpr swoc::TextView ZERO_CHUNK{"0\r\n"};
+  static constexpr swoc::TextView ZERO_CHUNK{"0\r\n\r\n"};
 
   swoc::LocalBufferWriter<10> w; // 8 bytes of size (32 bits) CR LF
   ssize_t n;
@@ -292,6 +308,8 @@ ChunkCodex::transmit(Stream &stream, swoc::TextView data, size_t chunk_size) {
       if (n > 0) {
         total += n;
         if (n == chunk_size) {
+          w.clear().print("{}", HTTP_EOL); // Each chunk much terminate with CRLF
+          stream.write(w.view());
           data.remove_prefix(chunk_size);
         } else {
           return {total, std::error_code(errno, std::system_category())};
@@ -314,6 +332,9 @@ void HttpHeader::global_init() {
 
   STATUS_NO_CONTENT[204] = true;
   STATUS_NO_CONTENT[304] = true;
+  for (auto code = 400; code < 600; code++) {
+    STATUS_NO_CONTENT[code] = true;
+  }
 }
 
 void HttpHeader::set_max_content_length(size_t n) {
@@ -325,18 +346,25 @@ void HttpHeader::set_max_content_length(size_t n) {
   };
 }
 
-swoc::Errata HttpHeader::update_content_length() {
+swoc::Errata HttpHeader::update_content_length(swoc::TextView method) {
   swoc::Errata errata;
   size_t cl = std::numeric_limits<size_t>::max();
   _content_length_p = false;
-  if (auto spot{_fields.find(FIELD_CONTENT_LENGTH)}; spot != _fields.end()) {
-    cl = swoc::svtou(spot->second);
-    if (_content_size != 0 && cl != _content_size) {
-      errata.info(R"(Conflicting sizes using "{}" value {} instead of {}.)", cl,
-                  _content_size);
-    }
-    _content_size = cl;
+  // Some methods ignore the Content-Length for the current transaction
+  if (strcasecmp(method, "HEAD") == 0) {
+    // Don't try chuned encoding later
+    _content_size = 0;
     _content_length_p = true;
+  } else {
+    if (auto spot{_fields.find(FIELD_CONTENT_LENGTH)}; spot != _fields.end()) {
+      cl = swoc::svtou(spot->second);
+      if (_content_size != 0 && cl != _content_size) {
+        errata.info(R"(Conflicting sizes using "{}" value {} instead of {}.)", cl,
+                    _content_size);
+      }
+      _content_size = cl;
+      _content_length_p = true;
+    }
   }
   return errata;
 }
@@ -385,6 +413,10 @@ swoc::Errata HttpHeader::transmit_body(Stream &stream) const {
 
 swoc::Errata HttpHeader::transmit(Stream &stream) const {
   swoc::Errata errata;
+  if (stream.is_closed()) {
+    errata.error(R"(Transmit stream is closed)");
+    return errata;
+  }
 
   if (_status) {
     swoc::LocalBufferWriter<MAX_HDR_SIZE> w;
@@ -435,7 +467,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
   }
 
   // If there's a status, and it indicates no body, we're done.
-  if (_status && STATUS_NO_CONTENT[_status] && !_content_length_p) {
+  if (_status && STATUS_NO_CONTENT[_status] && !_content_length_p && !_chunked_p) {
     return errata;
   }
 
@@ -466,6 +498,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
           // Is this an error? It's chunked, so an actual close seems unexpected
           // - should have parsed the empty chunk.
           Info("Connection closed on unbounded body.");
+          result = ChunkCodex::DONE;
         } else {
           errata.error(
               R"(Response underrun - received {} bytes of content, expected {}, when file closed because {}.)",
@@ -478,6 +511,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
         (content_length != UNBOUNDED && body_size != content_length)) {
       errata.error(R"(Invalid response - expected {} bytes, drained {} byts.)",
                    content_length, body_size);
+      return errata;
     }
     Info("Drained {} chunked bytes.", body_size);
   } else {
@@ -635,7 +669,7 @@ swoc::Errata HttpHeader::load(YAML::Node const &node) {
       auto field_list_node{hdr_node[YAML_FIELDS_KEY]};
       auto result{this->parse_fields(field_list_node)};
       if (result.is_ok()) {
-        errata.note(this->update_content_length());
+        errata.note(this->update_content_length(_method));
         errata.note(this->update_transfer_encoding());
       } else {
         errata.error("Failed to parse response at {}", node.Mark());
