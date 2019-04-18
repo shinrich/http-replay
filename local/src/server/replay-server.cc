@@ -410,8 +410,8 @@ int main(int argc, const char *argv[]) {
   engine.parser
       .add_command("run", "run <dir>: the replay server using data in <dir>",
                    "", 1, [&]() -> void { engine.command_run(); })
-      .add_option("--listen", "", "Listen address and port", "", 1, "")
-      .add_option("--listen-https", "", "Listen TLS address and port", "", 1,
+      .add_option("--listen", "", "Listen address and port. Can be a comma separated list.", "", 1, "")
+      .add_option("--listen-https", "", "Listen TLS address and port. Can be a comma separated list.", "", 1,
                   "")
       .add_option("--cert", "", "Specify certificate file", "", 1, "");
 

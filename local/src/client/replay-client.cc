@@ -322,9 +322,7 @@ struct Engine {
 
   static constexpr swoc::TextView COMMAND_RUN{"run"};
   static constexpr swoc::TextView COMMAND_RUN_ARGS{
-      "Arguments:\n\t<dir>: Directory containing replay files.\n\t<upstream>: "
-      "Upstream destination for http requests."
-      "Upstream destination for https requests."};
+      "Arguments:\n\t<dir>: Directory containing replay files.\n\t<upstream http>: hostname and port for http requests. Can be a comma seprated list\n\t<upstream https>: hostname and port for https requests.  Can be a comma separated list "};
   void command_run();
 
   /// Status code to return to the operating system.
