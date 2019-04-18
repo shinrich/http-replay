@@ -179,9 +179,20 @@ protected:
 
 class HttpHeader {
   using self_type = HttpHeader;
-  using Fields = std::unordered_map<swoc::TextView, std::string,
-                                    std::hash<std::string_view>>;
   using TextView = swoc::TextView;
+
+  //  using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
+  struct Hash {
+    swoc::Hash64FNV1a::value_type operator()(TextView view) const {
+      return swoc::Hash64FNV1a{}.hash_immediate(
+          swoc::transform_view_of(&tolower, view));
+    }
+    bool operator()(TextView lhs, TextView rhs) const {
+      return 0 == strcasecmp(lhs, rhs);
+    }
+  };
+  using NameSet = std::unordered_set<TextView, Hash, Hash>;
+  using Fields = std::unordered_map<swoc::TextView, std::string, Hash, Hash>;
 
 public:
   /// Parsing results.
@@ -202,8 +213,8 @@ public:
 
   HttpHeader() = default;
   HttpHeader(self_type const &) = delete;
-  HttpHeader(self_type && that) = default;
-  self_type & operator=(self_type && that) = default;
+  HttpHeader(self_type &&that) = default;
+  self_type &operator=(self_type &&that) = default;
 
   /** Read and parse a header.
    *
@@ -321,17 +332,6 @@ protected:
    */
   static TextView localize(TextView text);
 
-  //  using NameSet = std::unordered_set<TextView, std::hash<std::string_view>>;
-  struct Hash {
-    swoc::Hash64FNV1a::value_type operator()(TextView view) const {
-      return swoc::Hash64FNV1a{}.hash_immediate(
-          swoc::transform_view_of(&tolower, view));
-    }
-    bool operator()(TextView lhs, TextView rhs) const {
-      return 0 == strcasecmp(lhs, rhs);
-    }
-  };
-  using NameSet = std::unordered_set<TextView, Hash, Hash>;
   static NameSet _names;
   static swoc::MemArena _arena;
   /// Precomputed content buffer.
