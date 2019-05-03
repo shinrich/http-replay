@@ -862,6 +862,20 @@ swoc::Errata Load_Replay_File(swoc::file::path const &path,
                               result.note(handler.txn_close());
                             }
                             errata = std::move(result);
+                          // Deal with the cached case
+                          } else if (txn_node[YAML_CLIENT_REQ_KEY] && txn_node[YAML_PROXY_RSP_KEY]) {
+                            result.note(handler.txn_open(txn_node));
+                            if (result.is_ok()) {
+                              result.note(handler.client_request(
+                                  txn_node[YAML_CLIENT_REQ_KEY]));
+                              result.note(handler.proxy_request(
+                                  txn_node[YAML_CLIENT_REQ_KEY]));
+                              result.note(handler.proxy_response(
+                                  txn_node[YAML_PROXY_RSP_KEY]));
+                              result.note(handler.server_response(
+                                  txn_node[YAML_PROXY_RSP_KEY]));
+                              result.note(handler.txn_close());
+                            }
                           } else {
                             errata.error(
                                 R"(Transaction node at {} in "{}" did not contain all four required HTTP header keys.)",
