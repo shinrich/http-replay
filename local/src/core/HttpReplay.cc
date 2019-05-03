@@ -296,12 +296,11 @@ ChunkCodex::transmit(Stream &stream, swoc::TextView data, size_t chunk_size) {
   swoc::LocalBufferWriter<10> w; // 8 bytes of size (32 bits) CR LF
   ssize_t n;
   ssize_t total = 0;
-  w.print("{:x}{}", chunk_size, HTTP_EOL);
   while (data) {
     if (data.size() < chunk_size) {
-      w.clear().print("{:x}{}", data.size(), HTTP_EOL);
       chunk_size = data.size();
     }
+    w.clear().print("{:x}{}", chunk_size, HTTP_EOL);
     n = stream.write(w.view());
     if (n > 0) {
       n = stream.write({data.data(), chunk_size});
@@ -330,11 +329,9 @@ void HttpHeader::global_init() {
   FIELD_CONTENT_LENGTH = localize("Content-Length");
   FIELD_TRANSFER_ENCODING = localize("Transfer-Encoding");
 
+  STATUS_NO_CONTENT[100] = true;
   STATUS_NO_CONTENT[204] = true;
   STATUS_NO_CONTENT[304] = true;
-  for (auto code = 400; code < 600; code++) {
-    STATUS_NO_CONTENT[code] = true;
-  }
 }
 
 void HttpHeader::set_max_content_length(size_t n) {
@@ -406,6 +403,12 @@ swoc::Errata HttpHeader::transmit_body(Stream &stream) const {
                    swoc::bwf::If(_chunked_p, " [chunked]"), n, _content_size,
                    ec);
     }
+  } else if (!_content_size && _status && !STATUS_NO_CONTENT[_status]) {
+    // Go ahead and close the connection if it is not specified
+    if (!_chunked_p && !_content_length_p) {
+        Info("No CL or TE, status {} - closing.", _status);
+        stream.close();
+    }
   }
 
   return errata;
@@ -474,7 +477,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
   buff.reserve(std::min<size_t>(content_length, MAX_DRAIN_BUFFER_SIZE));
 
   if (stream.is_closed()) {
-    errata.error(R"(drain_body: stream closed)");
+    errata.error(R"(drain_body: stream closed) could not read {} bytes)", content_length);
     return errata; 
   }
 
@@ -512,7 +515,7 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
       errata.error(R"(Invalid response - expected {} bytes, drained {} byts.)",
                    content_length, body_size);
       return errata;
-    }
+    } 
     Info("Drained {} chunked bytes.", body_size);
   } else {
     body_size = initial.size();
@@ -530,6 +533,11 @@ swoc::Errata HttpHeader::drain_body(Stream &stream,
         break;
       }
       body_size += n;
+    }
+    if (body_size > content_length) {
+      errata.error(R"(Invalid response - expected {} fixed bytes, drained {} byts.)",
+                   content_length, body_size);
+      return errata;
     }
     Info("Drained {} bytes.", body_size);
   }
@@ -580,6 +588,7 @@ swoc::Rv<ssize_t> HttpHeader::read_header(Stream &reader,
         zret.errata().error(
             R"(Connection closed unexpectedly after {} bytes while waiting for header - {}.)",
             w.size(), swoc::bwf::Errno{});
+         printf("error\n");
       } else {
         zret = 0; // clean close between transactions.
       }

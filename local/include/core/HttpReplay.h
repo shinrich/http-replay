@@ -63,7 +63,7 @@ static const std::string YAML_HTTP_URL_KEY{"url"};
 static const std::string YAML_CONTENT_KEY{"content"};
 static const std::string YAML_CONTENT_LENGTH_KEY{"size"};
 
-static constexpr size_t MAX_HDR_SIZE = 65536;
+static constexpr size_t MAX_HDR_SIZE = 131072;	// Max our ATS is configured for
 static constexpr size_t MAX_DRAIN_BUFFER_SIZE = 1 << 20;
 /// HTTP end of line.
 static constexpr swoc::TextView HTTP_EOL{"\r\n"};
